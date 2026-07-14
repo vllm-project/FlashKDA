@@ -82,7 +82,8 @@ bash tests/test.sh
 
 ```python
 flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-              initial_state=None, final_state=None, cu_seqlens=None)
+              initial_state=None, final_state=None, cu_seqlens=None,
+              workspace=None)
 ```
 
 **Parameters:**
@@ -101,7 +102,8 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 | `lower_bound` | float | scalar | Gate lower bound (range from -5.0 to 0) |
 | `initial_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional) Initial recurrent state |
 | `final_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional, output) Final recurrent state |
-| `cu_seqlens` | int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
+| `cu_seqlens` | int32/int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
+| `workspace` | uint8/None | `[workspace_size]` | (optional) Reusable workspace; allocated automatically when omitted |
 
 - Currently requires `K = V = 128`.
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.

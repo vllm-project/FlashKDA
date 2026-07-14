@@ -57,6 +57,7 @@ ext_modules = [
         name='flash_kda_C',
         sources=[
             'csrc/flash_kda.cpp',
+            'csrc/torch_api.cpp',
             'csrc/smxx/fwd_launch.cu',
         ],
         include_dirs=[

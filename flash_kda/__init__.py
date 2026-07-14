@@ -2,7 +2,22 @@ import torch
 from flash_kda_C import fwd as _fwd_raw, get_workspace_size
 
 
-def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
+def fwd(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    out,
+    A_log,
+    dt_bias,
+    lower_bound,
+    initial_state=None,
+    final_state=None,
+    cu_seqlens=None,
+    workspace=None,
+):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
     Args:
@@ -23,19 +38,37 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
             for varlen mode. ``None`` means start from zero.
         final_state (torch.Tensor, optional): Output buffer for the final
             recurrent state. Same dtype/shape rules as ``initial_state``.
-        cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths, int64,
-            shape ``[N+1]``. When provided, ``B`` must be 1.
-
+        cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths, int32
+            or int64, shape ``[N+1]``. When provided, ``B`` must be 1.
+        workspace (torch.Tensor, optional): Reusable uint8 workspace. Allocated
+            automatically when omitted.
     Notes:
         * Currently requires ``K = V = 128``.
         * All input tensors must be CUDA, contiguous, and have the dtypes
           listed above.
     """
-    B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
-    T_total = B * T_seq
+    B, T_seq, H = q.shape[:3]
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
+    if workspace is None:
+        workspace = torch.empty(
+            get_workspace_size(B * T_seq, H, N),
+            dtype=torch.uint8,
+            device=q.device,
+        )
 
-    workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
-
-    _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
-             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+    _fwd_raw(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        float(scale),
+        out,
+        workspace,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens,
+    )
