@@ -94,7 +94,8 @@ template <
     int CHUNK,
     int D,
     int NumThreads,
-    bool IsVarlen = true
+    bool IsVarlen = true,
+    typename SeqlenT = int64_t
 >
 __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
@@ -112,7 +113,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int T_total,
     int H,
     int N,
-    int64_t const* cu_seqlens,
+    SeqlenT const* cu_seqlens,
     int total_tiles,
     float const* A_log_ptr,
     float gate_scale

@@ -128,7 +128,8 @@ template <
     bool HasStateIn = true,
     bool HasStateOut = true,
     bool StateFP32 = false,
-    bool IsVarlen = true
+    bool IsVarlen = true,
+    typename SeqlenT = int64_t
 >
 __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
@@ -146,7 +147,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     int T_total,
     int H,
     int N,
-    int64_t const* cu_seqlens,
+    SeqlenT const* cu_seqlens,
     int total_tiles
 ) {
     using BF16 = cutlass::bfloat16_t;

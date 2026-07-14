@@ -1,11 +1,13 @@
-#include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+
+#include "flash_kda.h"
 #include "fwd.h"
 
 int64_t get_workspace_size(
     int64_t T_total,
     int64_t H,
-    int64_t N = 1
+    int64_t N
 ) {
     constexpr int CHUNK = 16;
     constexpr int D = 128;
@@ -28,21 +30,20 @@ void fwd(
     torch::Tensor v,
     torch::Tensor g,
     torch::Tensor beta,
-    float scale,
+    double scale,
     torch::Tensor out,
     torch::Tensor workspace,
     torch::Tensor A_log,
     torch::Tensor dt_bias,
     double lower_bound,
-    std::optional<torch::Tensor> initial_state = std::nullopt,
-    std::optional<torch::Tensor> final_state = std::nullopt,
-    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+    std::optional<torch::Tensor> initial_state,
+    std::optional<torch::Tensor> final_state,
+    std::optional<torch::Tensor> cu_seqlens
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
                 "all tensors must be contiguous");
-
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
     TORCH_CHECK(v.dtype() == torch::kBFloat16, "v must be bfloat16");
@@ -141,17 +142,23 @@ void fwd(
     // Determine cu_seqlens and N
     bool is_varlen = cu_seqlens.has_value();
     int64_t N_val;
-    int64_t const* cu_seqlens_dev = nullptr;
+    void const* cu_seqlens_dev = nullptr;
+    bool cu_seqlens_is_int32 = false;
 
     if (is_varlen) {
         TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
         TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
-        TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
+        TORCH_CHECK(
+            cu_seqlens_t.dtype() == torch::kInt ||
+                cu_seqlens_t.dtype() == torch::kLong,
+            "cu_seqlens must be int32 or int64");
+        TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
         TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
         TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-        cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
+        cu_seqlens_is_int32 = cu_seqlens_t.dtype() == torch::kInt;
+        cu_seqlens_dev = cu_seqlens_t.data_ptr();
     } else {
         N_val = B;
     }
@@ -177,53 +184,45 @@ void fwd(
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
     }
 
-    // Dispatch based on state configuration and varlen
-    #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
-            q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
-            initial_state_raw, scale_f, final_state_raw, out_ptr, \
-            workspace_ptr, total_tiles, \
-            int(T_total), int(H), int(N_val), cu_seqlens_dev, \
-            A_log_ptr, dt_bias_ptr, gate_scale, stream)
+    auto dispatch = [&](auto typed_cu_seqlens) {
+        #define LAUNCH(HI, HO, FP32, VL) \
+            launch_fwd<128, HI, HO, FP32, VL>( \
+                q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                initial_state_raw, scale_f, final_state_raw, out_ptr, \
+                workspace_ptr, total_tiles, \
+                int(T_total), int(H), int(N_val), typed_cu_seqlens, \
+                A_log_ptr, dt_bias_ptr, gate_scale, stream)
 
-    #define DISPATCH_STATE(VL) \
-        if (!has_state_in && !has_state_out) { \
-            LAUNCH(false, false, false, VL); \
-        } else if (has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(true, true, true, VL); \
-        } else if (has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(true, true, false, VL); \
-        } else if (!has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(false, true, true, VL); \
-        } else if (!has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(false, true, false, VL); \
-        } else if (has_state_in && !has_state_out && state_fp32) { \
-            LAUNCH(true, false, true, VL); \
-        } else { \
-            LAUNCH(true, false, false, VL); \
+        #define DISPATCH_STATE(VL) \
+            if (!has_state_in && !has_state_out) { \
+                LAUNCH(false, false, false, VL); \
+            } else if (has_state_in && has_state_out && state_fp32) { \
+                LAUNCH(true, true, true, VL); \
+            } else if (has_state_in && has_state_out && !state_fp32) { \
+                LAUNCH(true, true, false, VL); \
+            } else if (!has_state_in && has_state_out && state_fp32) { \
+                LAUNCH(false, true, true, VL); \
+            } else if (!has_state_in && has_state_out && !state_fp32) { \
+                LAUNCH(false, true, false, VL); \
+            } else if (has_state_in && !has_state_out && state_fp32) { \
+                LAUNCH(true, false, true, VL); \
+            } else { \
+                LAUNCH(true, false, false, VL); \
+            }
+
+        if (is_varlen) {
+            DISPATCH_STATE(true);
+        } else {
+            DISPATCH_STATE(false);
         }
 
-    if (is_varlen) {
-        DISPATCH_STATE(true);
+        #undef DISPATCH_STATE
+        #undef LAUNCH
+    };
+
+    if (cu_seqlens_is_int32) {
+        dispatch(static_cast<int32_t const*>(cu_seqlens_dev));
     } else {
-        DISPATCH_STATE(false);
+        dispatch(static_cast<int64_t const*>(cu_seqlens_dev));
     }
-
-    #undef DISPATCH_STATE
-    #undef LAUNCH
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fwd", &fwd, "FlashKDA Forward (CUDA)",
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
-        py::arg("scale"), py::arg("out"),
-        py::arg("workspace"),
-        py::arg("A_log"), py::arg("dt_bias"), py::arg("lower_bound"),
-        py::arg("initial_state") = py::none(), py::arg("final_state") = py::none(),
-        py::arg("cu_seqlens") = py::none());
-    m.def("get_workspace_size",
-        static_cast<int64_t(*)(int64_t, int64_t, int64_t)>(&get_workspace_size),
-        "Get workspace size in bytes",
-        py::arg("T_total"), py::arg("H"),
-        py::arg("N") = 1);
 }
