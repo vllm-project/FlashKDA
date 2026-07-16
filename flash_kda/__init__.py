@@ -44,8 +44,8 @@ def fwd(
             automatically when omitted.
     Notes:
         * Currently requires ``K = V = 128``.
-        * All input tensors must be CUDA, contiguous, and have the dtypes
-          listed above.
+        * Beta may be strided; other input and output tensors must be
+          contiguous.
     """
     B, T_seq, H = q.shape[:3]
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
