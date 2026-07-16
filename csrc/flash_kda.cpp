@@ -42,8 +42,8 @@ void fwd(
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
-                "all tensors must be contiguous");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
+                "q, k, v, g, out, and workspace must be contiguous");
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
     TORCH_CHECK(v.dtype() == torch::kBFloat16, "v must be bfloat16");
@@ -112,7 +112,6 @@ void fwd(
     auto k_3d = k.reshape({T_total, H, D});
     auto v_3d = v.reshape({T_total, H, D});
     auto g_3d = g.reshape({T_total, H, D});
-    auto beta_2d = beta.reshape({T_total, H});
     auto out_3d = out.reshape({T_total, H, D});
 
     auto q_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(q_3d.data_ptr<at::BFloat16>());
@@ -125,8 +124,8 @@ void fwd(
     auto dt_bias_ptr = dt_bias.data_ptr<float>();
     float gate_scale = float(lower_bound * 1.4426950408889634);
 
-    // Transpose beta: [T_total, H] -> [H, T_total] (1D TMA, no T alignment constraint)
-    auto beta_t = beta_2d.t().contiguous();
+    // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
+    auto beta_t = beta.permute({2, 0, 1}).contiguous().view({H, T_total});
     auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.data_ptr<at::BFloat16>());
 
     auto workspace_ptr = workspace.data_ptr();
