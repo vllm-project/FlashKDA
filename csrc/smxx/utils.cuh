@@ -111,7 +111,6 @@ cutlass::PipelineTmaAsync<Stages> make_load_pipeline(
     params.num_producers = num_producers;
 
     Pipeline pipeline(storage, params, Shape<_1,_1>{});
-    cutlass::pipeline_init_wait(1);
     return pipeline;
 }
 
@@ -138,7 +137,6 @@ cutlass::PipelineAsync<Stages> make_store_pipeline(
     params.consumer_arv_count = num_consumers;
 
     Pipeline pipeline(storage, params);
-    cutlass::pipeline_init_wait(1);
     return pipeline;
 }
 
