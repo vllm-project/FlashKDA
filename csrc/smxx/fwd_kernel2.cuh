@@ -150,6 +150,10 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     SeqlenT const* cu_seqlens,
     int total_tiles
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+
     using BF16 = cutlass::bfloat16_t;
     using FP16 = cutlass::half_t;
     using Layouts = K2Layouts<D, CHUNK>;
@@ -795,6 +799,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 cta_tma_store_state.partition_D(g_final_tile)
             );
             tma_store_arrive();
+            tma_store_wait<0>();
         }
     }
 
@@ -827,9 +832,13 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 cta_tma_store_state.partition_D(g_final_tile)
             );
             tma_store_arrive();
+            tma_store_wait<0>();
         }
     }
 
     __syncthreads();
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }

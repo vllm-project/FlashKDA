@@ -118,6 +118,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     float const* A_log_ptr,
     float gate_scale
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+
     // --- constants
     using BF16 = cutlass::bfloat16_t;
     using FP16 = cutlass::half_t;
@@ -179,7 +183,12 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     seq_len = int(eos - bos);
     t_tiles_this_seq = (seq_len + CHUNK - 1) / CHUNK;
     // Early exit for excess CTAs (total_tiles is an upper bound)
-    if (local_t >= t_tiles_this_seq) return;
+    if (local_t >= t_tiles_this_seq) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+    }
     // --- TMA load inputs (single-shot, no pipeline)
     // Only thread 0 issues TMA loads (not elect_one_sync which is per-warp)
     if (threadIdx.x == 0) {
@@ -568,4 +577,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     }
     tma_store_wait<0>();
     __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }

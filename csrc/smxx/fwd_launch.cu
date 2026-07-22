@@ -168,7 +168,18 @@ void launch_fwd(
         dim3 grid_k1(total_tiles, H);
         dim3 block_k1(kK1Threads);
 
-        kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+        cudaLaunchConfig_t config{};
+        config.gridDim = grid_k1;
+        config.blockDim = block_k1;
+        config.dynamicSmemBytes = smem_size_k1;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attrs;
+        config.numAttrs = 1;
+
+        cudaLaunchKernelEx(&config, kernel1,
             tma_load_q, tma_load_k, tma_load_beta,
             tma_load_g, tma_load_dt_bias,
             tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
@@ -202,7 +213,18 @@ void launch_fwd(
         dim3 grid_k2(N, H);
         dim3 block_k2(kK2Threads);
 
-        kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
+        cudaLaunchConfig_t config{};
+        config.gridDim = grid_k2;
+        config.blockDim = block_k2;
+        config.dynamicSmemBytes = smem_size_k2;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attrs;
+        config.numAttrs = 1;
+
+        cudaLaunchKernelEx(&config, kernel2,
             tma_load_v, tma_load_beta2,
             tma_load_ws_kd, tma_load_ws_qd, tma_load_ws_kr,
             tma_load_ws_gt, tma_load_ws_inv, tma_load_ws_mqk,
