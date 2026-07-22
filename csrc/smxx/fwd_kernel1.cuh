@@ -118,8 +118,6 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     float const* A_log_ptr,
     float gate_scale
 ) {
-    cudaGridDependencySynchronize();
-
     // --- constants
     using BF16 = cutlass::bfloat16_t;
     using FP16 = cutlass::half_t;
@@ -145,6 +143,14 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     extern __shared__ __align__(128) unsigned char shared_mem[];
     using SharedStorageT = SharedStorageK1<Layouts>;
     SharedStorageT& shared_storage = *reinterpret_cast<SharedStorageT*>(shared_mem);
+    int warp_id = cutlass::canonical_warp_idx_sync();
+
+    if (warp_id == 0 && cute::elect_one_sync()) {
+        shared_storage.tma_load_barrier.init(1);
+        cutlass::arch::fence_barrier_init();
+    }
+    __syncthreads();
+    cudaGridDependencySynchronize();
 
     // --- per-CTA tile info
     int global_tile_idx = blockIdx.x;
@@ -186,11 +192,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         return;
     }
     // --- TMA load inputs (single-shot, no pipeline)
-    // Only thread 0 issues TMA loads (not elect_one_sync which is per-warp)
-    if (threadIdx.x == 0) {
+    if (warp_id == 0) {
         using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-        shared_storage.tma_load_barrier.init(1);
-        shared_storage.tma_load_barrier.arrive_and_expect_tx(kTmaTransactionBytes);
 
         Tensor g_q = tma_load_q.get_tma_tensor(make_shape(H, T_total, D));
         Tensor g_k = tma_load_k.get_tma_tensor(make_shape(H, T_total, D));
@@ -215,21 +218,11 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         Tensor s_k_tile = make_tensor(make_smem_ptr(shared_storage.k.begin()), TMAQKLayout{});
         Tensor s_beta_tile = make_tensor(make_smem_ptr(shared_storage.beta.begin()), TMABetaSmemLayout{});
 
-        cute::copy(tma_load_q.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_q.partition_S(g_q_tile), cta_tma_load_q.partition_D(s_q_tile));
-        cute::copy(tma_load_k.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_k.partition_S(g_k_tile), cta_tma_load_k.partition_D(s_k_tile));
-        cute::copy(tma_load_beta.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_beta.partition_S(g_beta_tile), cta_tma_load_beta.partition_D(s_beta_tile));
-
         // TMA load g_bf16 (same gmem layout as q/k)
         Tensor g_g = tma_load_g.get_tma_tensor(make_shape(H, T_total, D));
         auto cta_tma_load_g = tma_load_g.get_slice(Int<0>{});
         Tensor g_g_tile = make_tensor(g_g.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
         Tensor s_g_bf16_tile = make_tensor(make_smem_ptr(shared_storage.g_bf16.begin()), TMAQKLayout{});
-        cute::copy(tma_load_g.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_g.partition_S(g_g_tile), cta_tma_load_g.partition_D(s_g_bf16_tile));
-
         // TMA load dt_bias [H, D] → [D] slice for current head
         Tensor g_dt = tma_load_dt_bias.get_tma_tensor(make_shape(H, D));
         auto cta_tma_load_dt = tma_load_dt_bias.get_slice(Int<0>{});
@@ -237,15 +230,25 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         Tensor g_dt_tile = make_tensor(g_dt.data() + dt_off,
             make_layout(make_shape(Int<1>{}, Int<D>{}), stride(g_dt.layout())));
         Tensor s_dt_tile = make_tensor(make_smem_ptr(shared_storage.dt_bias.begin()), TMAGTotalSmemLayout{});
-        cute::copy(tma_load_dt_bias.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_dt.partition_S(g_dt_tile), cta_tma_load_dt.partition_D(s_dt_tile));
+        if (cute::elect_one_sync()) {
+            shared_storage.tma_load_barrier.arrive_and_expect_tx(kTmaTransactionBytes);
+            cute::copy(tma_load_q.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
+                cta_tma_load_q.partition_S(g_q_tile), cta_tma_load_q.partition_D(s_q_tile));
+            cute::copy(tma_load_k.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
+                cta_tma_load_k.partition_S(g_k_tile), cta_tma_load_k.partition_D(s_k_tile));
+            cute::copy(tma_load_beta.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
+                cta_tma_load_beta.partition_S(g_beta_tile), cta_tma_load_beta.partition_D(s_beta_tile));
+            cute::copy(tma_load_g.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
+                cta_tma_load_g.partition_S(g_g_tile), cta_tma_load_g.partition_D(s_g_bf16_tile));
+            cute::copy(tma_load_dt_bias.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
+                cta_tma_load_dt.partition_S(g_dt_tile), cta_tma_load_dt.partition_D(s_dt_tile));
+        }
+        // --- Wait for TMA (q, k, beta, g_bf16, dt_bias)
+        shared_storage.tma_load_barrier.wait(0);
     }
 
     // --- Compute a_log_exp (overlaps with TMA)
     float a_log_exp = expf(A_log_ptr[head_idx]);
-    // --- Wait for TMA (q, k, beta, g_bf16, dt_bias)
-    __syncthreads();
-    shared_storage.tma_load_barrier.wait(0);
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
 
@@ -502,7 +505,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     // Fence + sync combined: completion + TMA visibility
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
-    if (threadIdx.x == 0) {
+
+    cudaTriggerProgrammaticLaunchCompletion();
+
+    if (warp_id == 0) {
         int ws_idx = head_idx * total_tiles + global_tile_idx;
         // Store k_decayed [CHUNK, D] bf16
         {
@@ -512,8 +518,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws.layout())));
             Tensor s_kd = make_tensor(make_smem_ptr(shared_storage.k_decayed.begin()), TMAVOLayout{});
             auto cta_tma = tma_store_ws_kd.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_kd, cta_tma.partition_S(s_kd), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_kd, cta_tma.partition_S(s_kd), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
         // Store q_decayed
         {
@@ -523,8 +531,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws.layout())));
             Tensor s_qd = make_tensor(make_smem_ptr(shared_storage.q_decayed.begin()), TMAVOLayout{});
             auto cta_tma = tma_store_ws_qd.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_qd, cta_tma.partition_S(s_qd), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_qd, cta_tma.partition_S(s_qd), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
         // Store k_restored
         {
@@ -534,8 +544,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws.layout())));
             Tensor s_kr = make_tensor(make_smem_ptr(shared_storage.k_restored.begin()), TMAVOLayout{});
             auto cta_tma = tma_store_ws_kr.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_kr, cta_tma.partition_S(s_kr), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_kr, cta_tma.partition_S(s_kr), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
         // Store g_total [D] float
         {
@@ -545,8 +557,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<D>{}), stride(g_ws.layout())));
             Tensor s_gt = make_tensor(make_smem_ptr(shared_storage.g_total.begin()), TMAGTotalSmemLayout{});
             auto cta_tma = tma_store_ws_gt.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_gt, cta_tma.partition_S(s_gt), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_gt, cta_tma.partition_S(s_gt), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
         // Store INV [CHUNK, CHUNK] bf16
         {
@@ -556,8 +570,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<CHUNK>{}), stride(g_ws.layout())));
             Tensor s_inv = make_tensor(make_smem_ptr(shared_storage.INV.begin()), TMALMLayout{});
             auto cta_tma = tma_store_ws_inv.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_inv, cta_tma.partition_S(s_inv), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_inv, cta_tma.partition_S(s_inv), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
         // Store Mqk [CHUNK, CHUNK] bf16
         {
@@ -567,11 +583,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<CHUNK>{}), stride(g_ws.layout())));
             Tensor s_mqk = make_tensor(make_smem_ptr(shared_storage.Mqk.begin()), TMALMLayout{});
             auto cta_tma = tma_store_ws_mqk.get_slice(Int<0>{});
-            cute::copy(tma_store_ws_mqk, cta_tma.partition_S(s_mqk), cta_tma.partition_D(g_ws_tile));
-            tma_store_arrive();
+            if (cute::elect_one_sync()) {
+                cute::copy(tma_store_ws_mqk, cta_tma.partition_S(s_mqk), cta_tma.partition_D(g_ws_tile));
+                tma_store_arrive();
+            }
         }
     }
-    cudaTriggerProgrammaticLaunchCompletion();
-    tma_store_wait<0>();
-    __syncthreads();
 }
