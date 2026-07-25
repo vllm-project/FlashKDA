@@ -824,5 +824,4 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         }
     }
 
-    __syncthreads();
 }
