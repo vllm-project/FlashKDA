@@ -534,9 +534,5 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.Mqk.begin(), mqk_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
         tma_store_arrive();
-
-        // The initiating thread must keep shared memory alive until every
-        // bulk store has finished reading its source.
-        tma_store_wait<0>();
     }
 }
