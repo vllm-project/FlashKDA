@@ -185,7 +185,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         uint32_t(cute::cosize_v<LMLayout>) * uint32_t(sizeof(BF16)) * 2;
 
     // --- warp specialization
-    int warp_id = threadIdx.x / kWarpSize;
+    int warp_id = cutlass::canonical_warp_idx_sync();
+    bool lane_predicate = cute::elect_one_sync();
     WarpRole warp_role = WarpRole::NonParticipant;
     if (warp_id < kComputeThreads / kWarpSize) {
         warp_role = WarpRole::MMA;
@@ -193,6 +194,13 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         warp_role = WarpRole::LOAD_QKG;
     } else if (warp_id < kComputeThreads / kWarpSize + 2) {
         warp_role = WarpRole::STORE;
+    }
+
+    if constexpr (HasStateIn) {
+        if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
+            shared_storage.state_acc_tma_barrier.init(1);
+            cutlass::arch::fence_barrier_init();
+        }
     }
 
     using LoadPipelineState = cutlass::PipelineState<InputStages>;
@@ -208,6 +216,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         shared_storage.store_pipeline,
         warp_role, kComputeThreads, 1
     );
+    // Both pipeline constructors initialize shared barriers. One collective
+    // wait covers them and the optional state-load barrier above.
+    cutlass::pipeline_init_wait(1);
 
     // --- per-block sequence info
     int head_idx = int(blockIdx.x);
@@ -236,17 +247,13 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     }
     int seq_len  = int(eos - bos);
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
-    bool lane_predicate = cute::elect_one_sync();
 
     // --- Load initial state
     if constexpr (HasStateIn && !StateFP32) {
         // BF16 state: TMA load directly into state_acc
-        if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
+        if (warp_role == WarpRole::LOAD_QKG) {
             using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
             constexpr uint32_t kStateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(BF16);
-
-            shared_storage.state_acc_tma_barrier.init(1);
-            shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
             auto init_off = g_init.layout()(seq_idx * H + head_idx, 0, 0);
@@ -255,26 +262,26 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
 
             auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
-                cta_tma_load_state.partition_S(g_init_tile),
-                cta_tma_load_state.partition_D(s_state)
-            );
+            if (cute::elect_one_sync()) {
+                shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
+                cute::copy(
+                    tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
+                    cta_tma_load_state.partition_S(g_init_tile),
+                    cta_tma_load_state.partition_D(s_state)
+                );
+            }
+            shared_storage.state_acc_tma_barrier.wait(0);
         }
         __syncthreads();
-        shared_storage.state_acc_tma_barrier.wait(0);
         cutlass::arch::fence_view_async_shared();
     } else if constexpr (HasStateIn && StateFP32) {
         // FP32 state: TMA load fp32 into pipeline buffer, then convert to bf16 in state_acc
         using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
         using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
 
-        if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
+        if (warp_role == WarpRole::LOAD_QKG) {
             using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
             constexpr uint32_t kFP32StateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(float);
-
-            shared_storage.state_acc_tma_barrier.init(1);
-            shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
             auto init_off = g_init.layout()(seq_idx * H + head_idx, 0, 0);
@@ -285,14 +292,17 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 TMAFP32StateSmemLayout{});
 
             auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
-                cta_tma_load_state.partition_S(g_init_tile),
-                cta_tma_load_state.partition_D(s_fp32)
-            );
+            if (cute::elect_one_sync()) {
+                shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
+                cute::copy(
+                    tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
+                    cta_tma_load_state.partition_S(g_init_tile),
+                    cta_tma_load_state.partition_D(s_fp32)
+                );
+            }
+            shared_storage.state_acc_tma_barrier.wait(0);
         }
         __syncthreads();
-        shared_storage.state_acc_tma_barrier.wait(0);
         cutlass::arch::fence_view_async_shared();
 
         // All threads: convert fp32 -> bf16 with layout transformation
@@ -312,7 +322,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         }
         __syncthreads();
     }
-    __syncthreads();
 
     // --- LOAD warp: issue TMA loads for v, beta, and workspace intermediates
     if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
