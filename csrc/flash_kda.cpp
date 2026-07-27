@@ -1,14 +1,27 @@
-#include <optional>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
-#include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_inl.h>
-#include <Python.h>
 
+#include "flash_kda.h"
 #include "fwd.h"
 
 using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
+
+int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N) {
+    constexpr int CHUNK = 16;
+    constexpr int D = 128;
+
+    int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+
+    static_assert(CHUNK * D * 2 % 128 == 0);
+    static_assert(D * 4 % 128 == 0);
+    static_assert(CHUNK * CHUNK * 2 % 128 == 0);
+
+    int64_t per_tile_bytes =
+        3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
+    return H * total_tiles * per_tile_bytes;
+}
 
 void fwd(
     const Tensor& q,
@@ -209,28 +222,4 @@ void fwd(
     } else {
         dispatch(static_cast<int64_t const*>(cu_seqlens_dev));
     }
-}
-
-STABLE_TORCH_LIBRARY(flash_kda, m) {
-    m.def(
-        "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
-        "float scale, Tensor out, Tensor workspace, Tensor A_log, "
-        "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
-        "Tensor? final_state=None, Tensor? cu_seqlens=None) -> ()");
-}
-
-STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {
-    m.impl("fwd", TORCH_BOX(&fwd));
-}
-
-static struct PyModuleDef flash_kda_module = {
-    PyModuleDef_HEAD_INIT,
-    "_C",
-    nullptr,
-    -1,
-    nullptr,
-};
-
-PyMODINIT_FUNC PyInit__C(void) {
-    return PyModule_Create(&flash_kda_module);
 }

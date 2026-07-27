@@ -4,12 +4,7 @@ from . import _C  # noqa: F401
 
 
 def get_workspace_size(T_total, H, N=1):
-    chunk = 16
-    d = 128
-
-    total_tiles = (T_total + chunk - 1) // chunk + N
-    per_tile_bytes = 3 * chunk * d * 2 + d * 4 + 2 * chunk * chunk * 2
-    return H * total_tiles * per_tile_bytes
+    return torch.ops.flash_kda.get_workspace_size(T_total, H, N)
 
 
 def fwd(
