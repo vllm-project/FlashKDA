@@ -54,10 +54,9 @@ def get_arch_flags():
 
 ext_modules = [
     CUDAExtension(
-        name='flash_kda_C',
+        name='flash_kda._C',
         sources=[
             'csrc/flash_kda.cpp',
-            'csrc/torch_api.cpp',
             'csrc/smxx/fwd_launch.cu',
         ],
         include_dirs=[
@@ -66,10 +65,18 @@ ext_modules = [
             os.path.join(this_dir, 'cutlass', 'tools', 'util', 'include'),
             os.path.join(this_dir, 'csrc'),
         ],
+        py_limited_api=True,
         extra_compile_args={
-            'cxx': ['-O3', '-Wno-psabi'],
+            'cxx': [
+                '-O3',
+                '-Wno-psabi',
+                '-DTORCH_TARGET_VERSION=0x020a000000000000',
+                '-DUSE_CUDA',
+            ],
             'nvcc': [
                 '-O3',
+                '-DTORCH_TARGET_VERSION=0x020a000000000000',
+                '-DUSE_CUDA',
                 '-U__CUDA_NO_HALF_OPERATORS__',
                 '-U__CUDA_NO_HALF_CONVERSIONS__',
                 '-U__CUDA_NO_HALF2_OPERATORS__',
@@ -102,5 +109,6 @@ setup(
     ext_modules=ext_modules,
     packages=['flash_kda'],
     cmdclass=cmdclass,
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
     zip_safe=False,
 )

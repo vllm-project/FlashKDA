@@ -1,5 +1,15 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+
+from . import _C  # noqa: F401
+
+
+def get_workspace_size(T_total, H, N=1):
+    chunk = 16
+    d = 128
+
+    total_tiles = (T_total + chunk - 1) // chunk + N
+    per_tile_bytes = 3 * chunk * d * 2 + d * 4 + 2 * chunk * chunk * 2
+    return H * total_tiles * per_tile_bytes
 
 
 def fwd(
@@ -56,7 +66,7 @@ def fwd(
             device=q.device,
         )
 
-    _fwd_raw(
+    torch.ops.flash_kda.fwd(
         q,
         k,
         v,
@@ -67,8 +77,8 @@ def fwd(
         workspace,
         A_log,
         dt_bias,
-        lower_bound,
-        initial_state=initial_state,
-        final_state=final_state,
-        cu_seqlens=cu_seqlens,
+        float(lower_bound),
+        initial_state,
+        final_state,
+        cu_seqlens,
     )
