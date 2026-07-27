@@ -8,18 +8,23 @@
 using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
 
-int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N) {
+int64_t get_workspace_size(
+    int64_t T_total,
+    int64_t H,
+    int64_t N
+) {
     constexpr int CHUNK = 16;
     constexpr int D = 128;
 
+    // Upper bound: each of N sequences adds at most 1 extra tile vs floor division
     int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
 
-    static_assert(CHUNK * D * 2 % 128 == 0);
-    static_assert(D * 4 % 128 == 0);
-    static_assert(CHUNK * CHUNK * 2 % 128 == 0);
+    static_assert(CHUNK * D * 2 % 128 == 0, "k_decayed/q_decayed/k_restored size must be 128-byte aligned");
+    static_assert(D * 4 % 128 == 0, "g_total size must be 128-byte aligned");
+    static_assert(CHUNK * CHUNK * 2 % 128 == 0, "INV/Mqk size must be 128-byte aligned");
 
-    int64_t per_tile_bytes =
-        3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
+    int64_t per_tile_bytes = 3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
+
     return H * total_tiles * per_tile_bytes;
 }
 
@@ -41,11 +46,8 @@ void fwd(
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
-    STD_TORCH_CHECK(q.is_contiguous() && k.is_contiguous() &&
-                        v.is_contiguous() && g.is_contiguous() &&
-                        out.is_contiguous() && workspace.is_contiguous(),
+    STD_TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
                     "q, k, v, g, out, and workspace must be contiguous");
-
     STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16, "q must be bfloat16");
     STD_TORCH_CHECK(k.scalar_type() == ScalarType::BFloat16, "k must be bfloat16");
     STD_TORCH_CHECK(v.scalar_type() == ScalarType::BFloat16, "v must be bfloat16");
@@ -59,14 +61,14 @@ void fwd(
     bool state_fp32 = false;
 
     if (has_state_in) {
-        const Tensor& is = initial_state.value();
+        auto& is = initial_state.value();
         STD_TORCH_CHECK(is.is_cuda() && is.is_contiguous(), "initial_state must be contiguous CUDA tensor");
         STD_TORCH_CHECK(is.scalar_type() == ScalarType::BFloat16 || is.scalar_type() == ScalarType::Float,
                         "initial_state must be bfloat16 or float32");
         if (is.scalar_type() == ScalarType::Float) state_fp32 = true;
     }
     if (has_state_out) {
-        const Tensor& fs = final_state.value();
+        auto& fs = final_state.value();
         STD_TORCH_CHECK(fs.is_cuda() && fs.is_contiguous(), "final_state must be contiguous CUDA tensor");
         STD_TORCH_CHECK(fs.scalar_type() == ScalarType::BFloat16 || fs.scalar_type() == ScalarType::Float,
                         "final_state must be bfloat16 or float32");
@@ -119,7 +121,7 @@ void fwd(
     auto dt_bias_ptr = reinterpret_cast<float const*>(dt_bias.const_data_ptr());
     float gate_scale = float(lower_bound * 1.4426950408889634);
 
-    // Transpose beta: [T_total, H] -> [H, T_total] (1D TMA, no T alignment constraint)
+    // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
     Tensor beta_2d = torch::stable::reshape(beta, {T_total, H});
     Tensor beta_t = torch::stable::contiguous(torch::stable::transpose(beta_2d, 0, 1));
     auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.const_data_ptr());
@@ -144,17 +146,17 @@ void fwd(
 
     if (is_varlen) {
         STD_TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
-        const Tensor& cu_seqlens_t = cu_seqlens.value();
-        STD_TORCH_CHECK(cu_seqlens_t.is_cuda() && cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous CUDA tensor");
+        auto& cu_seqlens_t = cu_seqlens.value();
+        STD_TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
         STD_TORCH_CHECK(
             cu_seqlens_t.scalar_type() == ScalarType::Int ||
                 cu_seqlens_t.scalar_type() == ScalarType::Long,
             "cu_seqlens must be int32 or int64");
+        STD_TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
         STD_TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
         STD_TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-        cu_seqlens_is_int32 =
-            cu_seqlens_t.scalar_type() == ScalarType::Int;
+        cu_seqlens_is_int32 = cu_seqlens_t.scalar_type() == ScalarType::Int;
         cu_seqlens_dev = cu_seqlens_t.const_data_ptr();
     } else {
         N_val = B;
@@ -162,13 +164,13 @@ void fwd(
 
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {
-        const Tensor& is = initial_state.value();
+        auto& is = initial_state.value();
         STD_TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
         STD_TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
                         "initial_state must be [N, H, D, D]");
     }
     if (has_state_out) {
-        const Tensor& fs = final_state.value();
+        auto& fs = final_state.value();
         STD_TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
         STD_TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
                         "final_state must be [N, H, D, D]");

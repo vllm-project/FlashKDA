@@ -68,12 +68,7 @@ ext_modules = [
         ],
         py_limited_api=True,
         extra_compile_args={
-            'cxx': [
-                '-O3',
-                '-Wno-psabi',
-                '-DTORCH_TARGET_VERSION=0x020a000000000000',
-                '-DUSE_CUDA',
-            ],
+            'cxx': ['-O3', '-Wno-psabi', '-DTORCH_TARGET_VERSION=0x020a000000000000', '-DUSE_CUDA'],
             'nvcc': [
                 '-O3',
                 '-DTORCH_TARGET_VERSION=0x020a000000000000',

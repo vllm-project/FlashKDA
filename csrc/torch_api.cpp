@@ -8,9 +8,9 @@ STABLE_TORCH_LIBRARY(flash_kda, m) {
     m.def("get_workspace_size(int T_total, int H, int N=1) -> int");
     m.def(
         "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
-        "float scale, Tensor out, Tensor workspace, Tensor A_log, "
+        "float scale, Tensor(a!) out, Tensor workspace, Tensor A_log, "
         "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
-        "Tensor? final_state=None, Tensor? cu_seqlens=None) -> ()");
+        "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {

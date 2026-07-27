@@ -11,9 +11,6 @@ FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on C
 - CUDA 12.9 and above
 - PyTorch 2.10 and above
 
-The extension uses PyTorch's Stable ABI and CPython's Limited API (Python 3.10+),
-so one wheel can be reused across compatible PyTorch and Python versions.
-
 ## Installation
 ```bash
 git clone https://github.com/MoonshotAI/FlashKDA.git flash-kda

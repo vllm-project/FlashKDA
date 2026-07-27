@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <optional>
 
 #include <torch/csrc/stable/tensor.h>
