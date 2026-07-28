@@ -9,7 +9,7 @@ FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on C
 ## Requirements
 - SM90 and above
 - CUDA 12.9 and above
-- PyTorch 2.4 and above
+- PyTorch 2.10 and above
 
 ## Installation
 ```bash
