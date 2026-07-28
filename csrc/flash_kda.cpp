@@ -121,9 +121,7 @@ void fwd(
     auto dt_bias_ptr = reinterpret_cast<float const*>(dt_bias.const_data_ptr());
     float gate_scale = float(lower_bound * 1.4426950408889634);
 
-    // Permute beta from [B, T, H] to contiguous [H, B, T] storage, which is
-    // also the [H, B*T] layout consumed by the kernels. Both transposes are
-    // metadata-only, so this always performs exactly one materialization.
+    // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
     Tensor beta_bht = torch::stable::transpose(beta, 1, 2);
     Tensor beta_hbt = torch::stable::transpose(beta_bht, 0, 1);
     Tensor beta_t = torch::stable::contiguous(beta_hbt);

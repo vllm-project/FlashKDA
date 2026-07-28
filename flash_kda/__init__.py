@@ -72,8 +72,8 @@ def fwd(
         workspace,
         A_log,
         dt_bias,
-        float(lower_bound),
-        initial_state,
-        final_state,
-        cu_seqlens,
+        lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens,
     )
