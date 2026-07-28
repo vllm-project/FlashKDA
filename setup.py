@@ -104,7 +104,6 @@ setup(
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
     packages=['flash_kda'],
-    install_requires=['torch>=2.10.0'],
     cmdclass=cmdclass,
     options={"bdist_wheel": {"py_limited_api": "cp310"}},
     zip_safe=False,
