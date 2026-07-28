@@ -12,7 +12,7 @@ void fwd(
     const torch::stable::Tensor& v,
     const torch::stable::Tensor& g,
     const torch::stable::Tensor& beta,
-    float scale,
+    double scale,
     const torch::stable::Tensor& out,
     const torch::stable::Tensor& workspace,
     const torch::stable::Tensor& A_log,
