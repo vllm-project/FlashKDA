@@ -320,6 +320,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 buf[i] = BF16(0);
             }
         }
+        // generic writes -> visible to async proxy (TMA state store covers t_tiles==0)
+        cutlass::arch::fence_view_async_shared();
         __syncthreads();
     }
 
@@ -803,6 +805,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             shared_storage.state_acc.begin(),
             reinterpret_cast<float*>(shared_storage.state_fp32_buf),
             threadIdx.x);
+        cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
         __syncthreads();  // conversion complete
 
         if (warp_role == WarpRole::STORE && lane_predicate) {
