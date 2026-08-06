@@ -141,6 +141,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
+    float* checkpoint_state_ptr,
+    SeqlenT const* checkpoint_offsets,
     int T_total,
     int H,
     int N,
@@ -397,6 +399,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
     // --- MMA warps
     if (warp_role == WarpRole::MMA) {
+        cutlass::arch::NamedBarrier checkpoint_barrier(kComputeThreads, 0);
         LoadPipelineState load_read;
         StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
         int compute_tid = threadIdx.x;
@@ -462,6 +465,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             Tensor s_acc = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), StateSmemLayout{});
             Tensor s_acc_T = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TransposedStateSmemLayout{});
+            const bool export_checkpoint =
+                checkpoint_state_ptr != nullptr &&
+                checkpoint_offsets[seq_idx] == (t + 1) * CHUNK;
 
             // Fused MMA: v_sub, v_beta, U=INV@v, out=q@s, out+=Mqk@U, s_acc_update
             // Each warp handles TWO 16x16 column blocks (N=128 / 4 warps = 32 = 2 x 16)
@@ -713,16 +719,35 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                     // The store warp observes the last output-stage commit only
                     // after these writes and the following shared-memory fence.
                     if constexpr (HasStateOut) {
-                        if (t + 1 == t_tiles) {
+                        if (t + 1 == t_tiles || export_checkpoint) {
                             Tensor s_block = local_tile(
                                 s_acc_T,
                                 make_shape(Int<16>{}, Int<16>{}),
                                 make_coord(m, warp_id * 2 + bi));
                             copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_fragment), smem_thr_store_C_T.partition_D(s_block));
                         }
+                    } else if (export_checkpoint) {
+                        Tensor s_block = local_tile(
+                            s_acc_T,
+                            make_shape(Int<16>{}, Int<16>{}),
+                            make_coord(m, warp_id * 2 + bi));
+                        copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_fragment), smem_thr_store_C_T.partition_D(s_block));
                     }
                 }
             }
+            }
+            if (export_checkpoint) {
+                checkpoint_barrier.arrive_and_wait();
+                const int64_t checkpoint_base =
+                    int64_t(seq_idx * H + head_idx) * D * D;
+                for (int state_idx = compute_tid; state_idx < D * D;
+                     state_idx += kComputeThreads) {
+                    const int row = state_idx / D;
+                    const int col = state_idx % D;
+                    checkpoint_state_ptr[checkpoint_base + state_idx] =
+                        float(s_acc(row, col));
+                }
+                checkpoint_barrier.arrive_and_wait();
             }
             // The collective commit releases this input stage and publishes
             // both the output tile and an optional final-state spill.

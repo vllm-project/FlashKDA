@@ -20,4 +20,6 @@ void fwd(
     double lower_bound,
     std::optional<torch::stable::Tensor> initial_state = std::nullopt,
     std::optional<torch::stable::Tensor> final_state = std::nullopt,
-    std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt);
+    std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
+    std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
+    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt);
