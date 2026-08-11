@@ -230,8 +230,8 @@ void fwd(
         SeqlenPtr typed_checkpoint_offsets = has_checkpoint
             ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
             : nullptr;
-        #define LAUNCH(HI, HO, FP32, VL) \
-            launch_fwd<128, HI, HO, FP32, VL>( \
+        #define LAUNCH(HI, HO, FP32, CKPT, VL) \
+            launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
                 initial_state_raw, scale_f, final_state_raw, \
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
@@ -239,27 +239,35 @@ void fwd(
                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
                 A_log_ptr, dt_bias_ptr, gate_scale, stream)
 
-        #define DISPATCH_STATE(VL) \
+        #define DISPATCH_STATE(CKPT, VL) \
             if (!has_state_in && !has_state_out) { \
-                LAUNCH(false, false, false, VL); \
+                LAUNCH(false, false, false, CKPT, VL); \
             } else if (has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(true, true, true, VL); \
+                LAUNCH(true, true, true, CKPT, VL); \
             } else if (has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(true, true, false, VL); \
+                LAUNCH(true, true, false, CKPT, VL); \
             } else if (!has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(false, true, true, VL); \
+                LAUNCH(false, true, true, CKPT, VL); \
             } else if (!has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(false, true, false, VL); \
+                LAUNCH(false, true, false, CKPT, VL); \
             } else if (has_state_in && !has_state_out && state_fp32) { \
-                LAUNCH(true, false, true, VL); \
+                LAUNCH(true, false, true, CKPT, VL); \
             } else { \
-                LAUNCH(true, false, false, VL); \
+                LAUNCH(true, false, false, CKPT, VL); \
             }
 
         if (is_varlen) {
-            DISPATCH_STATE(true);
+            if (has_checkpoint) {
+                DISPATCH_STATE(true, true);
+            } else {
+                DISPATCH_STATE(false, true);
+            }
         } else {
-            DISPATCH_STATE(false);
+            if (has_checkpoint) {
+                DISPATCH_STATE(true, false);
+            } else {
+                DISPATCH_STATE(false, false);
+            }
         }
 
         #undef DISPATCH_STATE

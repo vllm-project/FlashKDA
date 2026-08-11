@@ -8,6 +8,7 @@ template <
     bool HasStateIn = true,
     bool HasStateOut = true,
     bool StateFP32 = false,
+    bool HasCheckpoint = false,
     bool IsVarlen = true,
     typename SeqlenT = int64_t>
 void launch_fwd(

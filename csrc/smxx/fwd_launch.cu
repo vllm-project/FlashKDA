@@ -10,6 +10,7 @@ template <
     bool HasStateIn,
     bool HasStateOut,
     bool StateFP32,
+    bool HasCheckpoint,
     bool IsVarlen,
     typename SeqlenT>
 void launch_fwd(
@@ -174,7 +175,8 @@ void launch_fwd(
             decltype(tma_store_final_state),
             decltype(tma_store_out),
             CHUNK, D, kInputStages, kOutputStages, kK2Threads,
-            HasStateIn, HasStateOut, StateFP32, IsVarlen, SeqlenT
+            HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
+            IsVarlen, SeqlenT
         >;
 
         cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
@@ -198,8 +200,8 @@ void launch_fwd(
 }
 
 // Explicit instantiations
-#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL, SEQLEN_T) \
-    template void launch_fwd<D, HI, HO, FP32, VL, SEQLEN_T>( \
+#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, CKPT, VL, SEQLEN_T) \
+    template void launch_fwd<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
@@ -207,14 +209,18 @@ void launch_fwd(
         int, int, int, int, \
         SEQLEN_T const*, float const*, float const*, float, cudaStream_t);
 
+#define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
+    INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T) \
+    INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, true,  VL, SEQLEN_T)
+
 #define INSTANTIATE_STATE_VARIANTS(VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, false, false, false, VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  VL, SEQLEN_T)
+    INSTANTIATE_CHECKPOINT_VARIANTS(true,  true,  false, VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(true,  true,  true,  VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(false, false, false, VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(false, true,  false, VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(true,  false, false, VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(false, true,  true,  VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(true,  false, true,  VL, SEQLEN_T)
 
 INSTANTIATE_STATE_VARIANTS(true, int32_t)
 INSTANTIATE_STATE_VARIANTS(true, int64_t)
