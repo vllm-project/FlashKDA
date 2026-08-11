@@ -1,11 +1,11 @@
-"""Focused exactness matrix for the K2 V-split implementations.
+"""Focused exactness matrix for the automatically dispatched K2 V-split.
 
-The cases are deliberately small (``H=1`` and at most 64 tokens) so this file
+The cases are deliberately small (``H=2`` and at most 64 tokens) so this file
 is suitable for the focused B300 test entry.  Coverage is nevertheless across
 fixed and varlen dispatch, both cu_seqlens integer types, empty sequences, all
-state input/output modes, and both supported state dtypes.  Every dispatched
-kernel is compared directly and bit-for-bit with ``torch_ref``; the original
-K2 is included as a control rather than used as the expected result.
+state input/output modes, and both supported state dtypes.  The automatic
+dispatch selects V-split for these low-parallelism cases, and every result is
+compared directly and bit-for-bit with ``torch_ref``.
 """
 
 from __future__ import annotations
@@ -26,9 +26,8 @@ from torch_ref import torch_ref
 
 
 D = 128
-H = 1
+H = 2
 LOWER_BOUND = -5.0
-VARIANTS = ("original", "split")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,7 +201,6 @@ def _run_kernel(
     problem: Problem,
     state_case: StateCase,
     initial_template: torch.Tensor | None,
-    variant: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     out = torch.full_like(problem.q, float("nan"))
     final_state = _fresh_final_state(problem, state_case)
@@ -232,40 +230,37 @@ def _run_kernel(
         final_state=final_state,
         cu_seqlens=problem.cu_seqlens,
         workspace=workspace,
-        use_vsplit=variant != "original",
     )
     torch.cuda.synchronize()
     return out, final_state
 
 
-def _assert_variants_exact(problem: Problem, state_case: StateCase) -> None:
+def _assert_vsplit_exact(problem: Problem, state_case: StateCase) -> None:
     initial_template = _state_template(problem, state_case)
     expected_out, expected_state = _run_reference(
         problem, state_case, initial_template
     )
 
-    for variant in VARIANTS:
-        actual_out, actual_state = _run_kernel(
-            problem, state_case, initial_template, variant
+    actual_out, actual_state = _run_kernel(
+        problem, state_case, initial_template
+    )
+    assert torch.equal(actual_out, expected_out), (
+        f"output differs from torch_ref for {state_case.name}"
+    )
+    if expected_state is not None:
+        assert actual_state is not None
+        assert torch.equal(actual_state, expected_state), (
+            f"final_state differs from torch_ref for {state_case.name}"
         )
-        assert torch.equal(actual_out, expected_out), (
-            f"{variant} output differs from torch_ref for {state_case.name}"
-        )
-        if expected_state is not None:
-            assert actual_state is not None
-            assert torch.equal(actual_state, expected_state), (
-                f"{variant} final_state differs from torch_ref for "
-                f"{state_case.name}"
-            )
 
 
 @pytest.mark.parametrize("state_case", STATE_CASES, ids=lambda case: case.name)
 def test_vsplit_fixed_exact(state_case: StateCase) -> None:
-    _assert_variants_exact(_make_fixed_problem(), state_case)
+    _assert_vsplit_exact(_make_fixed_problem(), state_case)
 
 
 def test_vsplit_stage_reuse_exact() -> None:
-    _assert_variants_exact(
+    _assert_vsplit_exact(
         _make_stage_reuse_problem(),
         StateCase("stage_reuse_fp32", True, True, torch.float32),
     )
@@ -280,4 +275,4 @@ def test_vsplit_stage_reuse_exact() -> None:
 def test_vsplit_varlen_exact(
     state_case: StateCase, cu_dtype: torch.dtype
 ) -> None:
-    _assert_variants_exact(_make_varlen_problem(cu_dtype), state_case)
+    _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)

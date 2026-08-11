@@ -10,8 +10,7 @@ STABLE_TORCH_LIBRARY(flash_kda, m) {
         "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
         "float scale, Tensor(a!) out, Tensor(c!) workspace, Tensor A_log, "
         "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
-        "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
-        "bool use_vsplit=False) -> ()");
+        "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {

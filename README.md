@@ -84,7 +84,7 @@ bash tests/test.sh
 ```python
 flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
               initial_state=None, final_state=None, cu_seqlens=None,
-              workspace=None, use_vsplit=False)
+              workspace=None)
 ```
 
 **Parameters:**
@@ -105,13 +105,14 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 | `final_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional, output) Final recurrent state |
 | `cu_seqlens` | int32/int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
 | `workspace` | uint8/None | `[workspace_size]` | (optional) Reusable workspace; allocated automatically when omitted |
-| `use_vsplit` | bool | scalar | (experimental) Split K2 into two `V=64` CTAs |
 
 - Currently requires `K = V = 128`.
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
-- `use_vsplit` defaults to `False`; the existing K2 path remains the default.
+- K2 automatically splits the value dimension into two `V=64` CTAs when
+  `2 * H * N <= SM count`, targeting workloads with insufficient CTA-level
+  parallelism.
 
 ## Development
 

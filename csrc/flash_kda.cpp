@@ -42,8 +42,7 @@ void fwd(
     double lower_bound,
     std::optional<Tensor> initial_state,
     std::optional<Tensor> final_state,
-    std::optional<Tensor> cu_seqlens,
-    bool use_vsplit
+    std::optional<Tensor> cu_seqlens
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
@@ -163,6 +162,17 @@ void fwd(
     } else {
         N_val = B;
     }
+
+    int num_sms = 0;
+    cudaError_t attr_status = cudaDeviceGetAttribute(
+        &num_sms,
+        cudaDevAttrMultiProcessorCount,
+        q.get_device_index());
+    STD_TORCH_CHECK(
+        attr_status == cudaSuccess,
+        "failed to query CUDA multiprocessor count: ",
+        cudaGetErrorString(attr_status));
+    bool use_vsplit = 2 * H * N_val <= num_sms;
 
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {

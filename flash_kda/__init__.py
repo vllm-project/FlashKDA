@@ -22,7 +22,6 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     workspace=None,
-    use_vsplit=False,
 ):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
@@ -48,7 +47,6 @@ def fwd(
             or int64, shape ``[N+1]``. When provided, ``B`` must be 1.
         workspace (torch.Tensor, optional): Reusable uint8 workspace. Allocated
             automatically when omitted.
-        use_vsplit (bool): Run K2 with two ``VD=64`` value slices.
     Notes:
         * Currently requires ``K = V = 128``.
         * Beta may be strided; other input and output tensors must be
@@ -78,5 +76,4 @@ def fwd(
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
-        use_vsplit=use_vsplit,
     )

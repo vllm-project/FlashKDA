@@ -412,7 +412,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
         constexpr int kValueBlocksPerWarp =
             VD / ((kComputeThreads / kWarpSize) * 16);
-        static_assert(kValueBlocksPerWarp >= 1);
+        static_assert(
+            kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
 
         // Keep this warp's value columns of the recurrent [K,V] state in
         // BF16 C fragments for the entire chunk loop. Phase 1 transposes each
