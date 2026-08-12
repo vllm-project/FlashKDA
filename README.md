@@ -74,6 +74,7 @@ bash tests/test.sh
 ```
 
 - `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
+- `tests/test_vsplit.py` — bitwise coverage for the experimental V-split K2 path
 
 
 ## Kernel API
@@ -109,6 +110,9 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
+- K2 automatically splits the value dimension into two `V=64` CTAs when
+  `2 * H * N <= SM count`, targeting workloads with insufficient CTA-level
+  parallelism.
 
 ## Development
 

@@ -163,6 +163,17 @@ void fwd(
         N_val = B;
     }
 
+    int num_sms = 0;
+    cudaError_t attr_status = cudaDeviceGetAttribute(
+        &num_sms,
+        cudaDevAttrMultiProcessorCount,
+        q.get_device_index());
+    STD_TORCH_CHECK(
+        attr_status == cudaSuccess,
+        "failed to query CUDA multiprocessor count: ",
+        cudaGetErrorString(attr_status));
+    bool use_vsplit = 2 * H * N_val <= num_sms;
+
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {
         auto& is = initial_state.value();
@@ -191,7 +202,7 @@ void fwd(
                 initial_state_raw, scale_f, final_state_raw, out_ptr, \
                 workspace_ptr, total_tiles, \
                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
-                A_log_ptr, dt_bias_ptr, gate_scale, stream)
+                A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
 
         #define DISPATCH_STATE(VL) \
             if (!has_state_in && !has_state_out) { \
