@@ -36,7 +36,7 @@ void launch_fwd(
 ) {
     using BF16 = cutlass::bfloat16_t;
     constexpr int kInputStages = 3;
-    constexpr int kOutputStages = 2;
+    constexpr int kOutputStages = 1;
     constexpr int CHUNK = 16;
     constexpr int VD = 64;
 
@@ -110,38 +110,26 @@ void launch_fwd(
     auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
     auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
 
-    // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
-    auto make_state_tma = [&](auto state_smem_layout,
-                              auto fp32_state_smem_layout) {
+    // --- Initial-state TMA descriptor
+    auto make_state_tma_load = [&](auto state_smem_layout,
+                                   auto fp32_state_smem_layout) {
         if constexpr (StateFP32) {
-            // FP32 state TMA descriptors
-            auto m_initial_fp32 = make_tensor(
-                make_gmem_ptr(static_cast<float const*>(initial_state_ptr)), state_gmem_layout);
-            auto m_final_fp32 = make_tensor(
-                make_gmem_ptr(static_cast<float*>(final_state_ptr)), state_gmem_layout);
-            auto tma_load = make_tma_copy(
+            auto state_ptr_load = HasStateIn
+                ? static_cast<float const*>(initial_state_ptr)
+                : reinterpret_cast<float const*>(out_ptr);  // dummy, never used
+            auto m_initial_fp32 = make_tensor(make_gmem_ptr(state_ptr_load), state_gmem_layout);
+            return make_tma_copy(
                 SM90_TMA_LOAD{}, m_initial_fp32, fp32_state_smem_layout);
-            auto tma_store = make_tma_copy(
-                SM90_TMA_STORE{}, m_final_fp32, fp32_state_smem_layout);
-            return cute::make_tuple(tma_load, tma_store);
         } else {
-            // BF16 state TMA descriptors (or dummy for no-state)
             auto state_ptr_load = HasStateIn
                 ? static_cast<BF16 const*>(initial_state_ptr)
                 : reinterpret_cast<BF16 const*>(out_ptr);  // dummy, never used
-            auto state_ptr_store = HasStateOut
-                ? static_cast<BF16*>(final_state_ptr)
-                : reinterpret_cast<BF16*>(out_ptr);  // dummy, never used
             auto m_init = make_tensor(make_gmem_ptr(state_ptr_load), state_gmem_layout);
-            auto m_final = make_tensor(make_gmem_ptr(state_ptr_store), state_gmem_layout);
-            auto tma_load = make_tma_copy(
+            return make_tma_copy(
                 SM90_TMA_LOAD{}, m_init, state_smem_layout);
-            auto tma_store = make_tma_copy(
-                SM90_TMA_STORE{}, m_final, state_smem_layout);
-            return cute::make_tuple(tma_load, tma_store);
         }
     };
-    auto [tma_load_initial_state, tma_store_final_state] = make_state_tma(
+    auto tma_load_initial_state = make_state_tma_load(
         TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
     // ===== Launch Kernel 1 (prepare) =====
 #if BLOCK_LEVEL_K1 >= 0
@@ -185,10 +173,9 @@ void launch_fwd(
                 SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{});
             auto tma_store_out_vsplit = make_tma_copy(
                 SM90_TMA_STORE{}, m_out, K2VSplitTMAVOLayout{});
-            auto [tma_load_initial_state_vsplit,
-                  tma_store_final_state_vsplit] =
-                make_state_tma(K2VSplitTMAStateSmemLayout{},
-                               K2VSplitTMAFP32StateSmemLayout{});
+            auto tma_load_initial_state_vsplit = make_state_tma_load(
+                K2VSplitTMAStateSmemLayout{},
+                K2VSplitTMAFP32StateSmemLayout{});
 
             using SharedStorageK2T = SharedStorageK2<
                 K2VSplitL, kInputStages, kOutputStages>;
@@ -199,7 +186,6 @@ void launch_fwd(
                 decltype(tma_load_v_vsplit),
                 decltype(tma_load_beta2),
                 decltype(tma_load_initial_state_vsplit),
-                decltype(tma_store_final_state_vsplit),
                 decltype(tma_store_out_vsplit),
                 CHUNK, D, kInputStages, kOutputStages, kK2Threads,
                 HasStateIn, HasStateOut, StateFP32, IsVarlen, SeqlenT,
@@ -210,11 +196,9 @@ void launch_fwd(
                 smem_size_k2);
             kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
                 tma_load_v_vsplit, tma_load_beta2,
-                tma_load_initial_state_vsplit,
-                tma_store_final_state_vsplit,
-                tma_store_out_vsplit,
-                out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
-                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+                tma_load_initial_state_vsplit, tma_store_out_vsplit,
+                out_ptr, final_state_ptr, T_total, H, N, cu_seqlens_ptr,
+                total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
             return;
         }
 
@@ -224,7 +208,6 @@ void launch_fwd(
         auto kernel2 = _flash_kda_fwd_recurrence<
             decltype(tma_load_v), decltype(tma_load_beta2),
             decltype(tma_load_initial_state),
-            decltype(tma_store_final_state),
             decltype(tma_store_out),
             CHUNK, D, kInputStages, kOutputStages, kK2Threads,
             HasStateIn, HasStateOut, StateFP32, IsVarlen, SeqlenT
@@ -239,9 +222,8 @@ void launch_fwd(
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
             tma_load_v, tma_load_beta2,
             tma_load_initial_state,
-            tma_store_final_state,
             tma_store_out,
-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+            out_ptr, final_state_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );
     }

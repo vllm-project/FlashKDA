@@ -72,8 +72,6 @@ struct SharedStorageK2 {
     using LMLayout = typename Layouts::LMLayout;
     using MMALayout = typename Layouts::MMALayout;
 
-    alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_acc;
-
     struct InputStorage {
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<VOLayout>> v;
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<BetaSmemLayout>> beta;
@@ -89,19 +87,19 @@ struct SharedStorageK2 {
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<VOLayout>> out;
     };
 
-    // Anonymous union: pipeline buffers share space with fp32 state conversion buffer.
-    // FP32 state load/store happens before/after the pipeline loop, so no overlap.
+    // Initial-state staging is drained into resident registers before the
+    // input/output pipelines reuse this storage.
     union {
         struct {
             InputStorage input[InputStages];
             OutputStorage output[OutputStages];
         };
-        alignas(128) char state_fp32_buf[cute::cosize_v<StateSmemLayout> * sizeof(float)];
+        alignas(128) char state_staging[cute::cosize_v<StateSmemLayout> * sizeof(float)];
     };
 
     typename cutlass::PipelineTmaAsync<InputStages>::SharedStorage load_pipeline;
     typename cutlass::PipelineAsync<OutputStages>::SharedStorage store_pipeline;
-    alignas(16) cutlass::arch::ClusterTransactionBarrier state_acc_tma_barrier;
+    alignas(16) cutlass::arch::ClusterTransactionBarrier state_tma_barrier;
 };
 
 template <class CFragment, class BFragment>
@@ -125,7 +123,6 @@ template <
     class TmaLoadV,
     class TmaLoadBeta,
     class TmaLoadState,
-    class TmaStoreState,
     class TmaStoreOut,
     int CHUNK,
     int D,
@@ -143,9 +140,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
     CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
     CUTE_GRID_CONSTANT TmaLoadState const tma_load_initial_state,
-    CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
+    void* final_state_raw_ptr,
     int T_total,
     int H,
     int N,
@@ -184,6 +181,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     constexpr int kWarpSize = 32;
     constexpr int kComputeThreads = 128;
     constexpr int kVSlices = D / VD;
+    constexpr int kValueBlocksPerWarp = VD / ((kComputeThreads / kWarpSize) * 16);
+    static_assert(kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
 
     // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
     constexpr uint32_t kTmaTransactionBytes =
@@ -207,7 +206,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
     if constexpr (HasStateIn) {
         if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
-            shared_storage.state_acc_tma_barrier.init(1);
+            shared_storage.state_tma_barrier.init(1);
             cutlass::arch::fence_barrier_init();
         }
     }
@@ -259,79 +258,137 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
 
     // --- Load initial state
-    if constexpr (HasStateIn && !StateFP32) {
-        // BF16 state: TMA load directly into state_acc
+    if constexpr (HasStateIn) {
         if (warp_role == WarpRole::LOAD_QKG) {
             using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-            constexpr uint32_t kStateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(BF16);
+            constexpr uint32_t kStateTransactionBytes =
+                cute::cosize_v<StateSmemLayout> * (StateFP32 ? sizeof(float) : sizeof(BF16));
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto init_off = g_init.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
+            auto init_off = g_init.layout()(
+                seq_idx * H + head_idx, v_idx * VD, 0);
             Tensor g_init_tile = make_tensor(g_init.data() + init_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_init.layout())));
-            Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
-
+                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}),
+                            stride(g_init.layout())));
             auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
-            if (cute::elect_one_sync()) {
-                shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
-                cute::copy(
-                    tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
-                    cta_tma_load_state.partition_S(g_init_tile),
-                    cta_tma_load_state.partition_D(s_state)
-                );
+
+            if constexpr (StateFP32) {
+                using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
+                Tensor s_state = make_tensor(
+                    make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_staging)),
+                    TMAFP32StateSmemLayout{});
+                if (cute::elect_one_sync()) {
+                    shared_storage.state_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
+                    cute::copy(
+                        tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_tma_barrier)),
+                        cta_tma_load_state.partition_S(g_init_tile),
+                        cta_tma_load_state.partition_D(s_state)
+                    );
+                }
+            } else {
+                Tensor s_state = make_tensor(
+                    make_smem_ptr(reinterpret_cast<BF16*>(shared_storage.state_staging)),
+                    TMAStateSmemLayout{});
+                if (cute::elect_one_sync()) {
+                    shared_storage.state_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
+                    cute::copy(
+                        tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_tma_barrier)),
+                        cta_tma_load_state.partition_S(g_init_tile),
+                        cta_tma_load_state.partition_D(s_state)
+                    );
+                }
             }
-            shared_storage.state_acc_tma_barrier.wait(0);
+            shared_storage.state_tma_barrier.wait(0);
         }
         __syncthreads();
         cutlass::arch::fence_view_async_shared();
-    } else if constexpr (HasStateIn && StateFP32) {
-        // FP32 state: TMA load fp32 into pipeline buffer, then convert to bf16 in state_acc
-        using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
-        using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
+    }
 
-        if (warp_role == WarpRole::LOAD_QKG) {
-            using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-            constexpr uint32_t kFP32StateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(float);
+    // Load the initial state once into BF16 C fragments; each MMA warp owns
+    // VD / 4 value columns and keeps them resident across the chunk loop.
+    auto resident_mma = make_tiled_mma(
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
+        Layout<Shape<_1,_1>>{},
+        Tile<_16,_16,_16>{});
+    const int resident_warp_id = threadIdx.x / kWarpSize;
+    const int resident_lane_id = threadIdx.x % kWarpSize;
+    auto resident_thr_mma = resident_mma.get_slice(resident_lane_id);
+    Tensor resident_ref = make_tensor(
+        make_smem_ptr(reinterpret_cast<BF16*>(shared_storage.state_staging)),
+        StateSmemLayout{});
+    auto resident_c_ref = resident_thr_mma.partition_C(local_tile(
+        resident_ref,
+        make_shape(Int<16>{}, Int<16>{}),
+        make_coord(0, 0)));
+    using ResidentStateFragment = decltype(make_fragment_like<BF16>(
+        resident_thr_mma.make_fragment_C(resident_c_ref)));
+    constexpr int kResidentStateRowBlocks = D / 16;
+    ResidentStateFragment
+        resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
 
-            Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto init_off = g_init.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
-            Tensor g_init_tile = make_tensor(g_init.data() + init_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_init.layout())));
-            Tensor s_fp32 = make_tensor(
-                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
-                TMAFP32StateSmemLayout{});
+    if (warp_role == WarpRole::MMA) {
+        if constexpr (HasStateIn && !StateFP32) {
+            Tensor staged_state_t = make_tensor(
+                make_smem_ptr(reinterpret_cast<BF16*>(shared_storage.state_staging)),
+                TransposedStateSmemLayout{});
+            auto resident_load_c = make_tiled_copy_C(
+                Copy_Atom<SM75_U16x8_LDSM_T, BF16>{}, resident_mma);
+            auto resident_thr_load_c = resident_load_c.get_slice(resident_lane_id);
 
-            auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
-            if (cute::elect_one_sync()) {
-                shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
-                cute::copy(
-                    tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
-                    cta_tma_load_state.partition_S(g_init_tile),
-                    cta_tma_load_state.partition_D(s_fp32)
-                );
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    Tensor state_block = local_tile(
+                        staged_state_t,
+                        make_shape(Int<16>{}, Int<16>{}),
+                        make_coord(
+                            m, resident_warp_id * kValueBlocksPerWarp + bi));
+                    cute::copy(
+                        resident_load_c,
+                        resident_thr_load_c.partition_S(state_block),
+                        resident_thr_load_c.retile_D(resident_state[bi][m]));
+                }
             }
-            shared_storage.state_acc_tma_barrier.wait(0);
-        }
-        __syncthreads();
-        cutlass::arch::fence_view_async_shared();
+        } else if constexpr (HasStateIn) {
+            using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
+            Tensor staged_fp32 = make_tensor(
+                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_staging)),
+                FP32StateSmemLayout{});
+            int value_base = resident_warp_id * kValueBlocksPerWarp * 16 +
+                resident_lane_id / 4;
+            int key_lane = (resident_lane_id % 4) * 2;
 
-        // All threads: convert fp32 -> bf16 with layout transformation
-        smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, VD, D, NumThreads>(
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            shared_storage.state_acc.begin(),
-            threadIdx.x);
-        __syncthreads();
-    } else {
-        // No state in: zero-initialize state_acc
-        {
-            BF16* buf = shared_storage.state_acc.begin();
-            constexpr int kTotal = cute::cosize_v<StateSmemLayout>;
-            for (int i = threadIdx.x; i < kTotal; i += NumThreads) {
-                buf[i] = BF16(0);
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    auto* destination = reinterpret_cast<uint32_t*>(&resident_state[bi][m](0));
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        int value = value_base + bi * 16 + (i / 2) * 8;
+                        int key = m * 16 + key_lane + (i % 2) * 8;
+                        float2 values = *reinterpret_cast<float2 const*>(&staged_fp32(value, key));
+                        BF16 low(values.x);
+                        BF16 high(values.y);
+                        uint32_t packed = uint32_t(low.raw()) | (uint32_t(high.raw()) << 16);
+                        SM75_U32x1_MOVM_T::copy(packed, destination[i]);
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    clear(resident_state[bi][m]);
+                }
             }
         }
-        // generic writes -> visible to async proxy (TMA state store covers t_tiles==0)
-        cutlass::arch::fence_view_async_shared();
+    }
+
+    // The producer may now overwrite initial-state staging with tile 0.
+    if constexpr (HasStateIn) {
         __syncthreads();
     }
 
@@ -412,55 +469,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
         int compute_tid = threadIdx.x;
 
-        constexpr int kValueBlocksPerWarp =
-            VD / ((kComputeThreads / kWarpSize) * 16);
-        static_assert(
-            kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
-
-        // Keep this warp's value columns of the recurrent [K,V] state in
-        // BF16 C fragments for the entire chunk loop. Phase 1 transposes each
-        // fragment into an MMA-B operand with MOVM_T; Phase 6 updates the C
-        // fragment in place. Shared memory is touched only at entry and, when
-        // requested, once more before the final-state TMA store.
-        Tensor resident_s_acc_T = make_tensor(
-            make_smem_ptr(shared_storage.state_acc.begin()),
-            TransposedStateSmemLayout{});
-        auto resident_mma = make_tiled_mma(
-            MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
-            Layout<Shape<_1,_1>>{},
-            Tile<_16,_16,_16>{});
-        const int resident_warp_id = compute_tid / kWarpSize;
-        const int resident_lane_id = compute_tid % kWarpSize;
-        auto resident_thr_mma = resident_mma.get_slice(resident_lane_id);
-        auto resident_load_c = make_tiled_copy_C(
-            Copy_Atom<SM75_U16x8_LDSM_T, BF16>{}, resident_mma);
-        auto resident_thr_load_c = resident_load_c.get_slice(resident_lane_id);
-        Tensor resident_state_ref = local_tile(
-            resident_s_acc_T,
-            make_shape(Int<16>{}, Int<16>{}),
-            make_coord(0, resident_warp_id * kValueBlocksPerWarp));
-        auto resident_c_ref = resident_thr_mma.partition_C(resident_state_ref);
-        using ResidentStateFragment = decltype(make_fragment_like<BF16>(
-            resident_thr_mma.make_fragment_C(resident_c_ref)));
-        constexpr int kResidentStateRowBlocks = D / 16;
-        ResidentStateFragment resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
-
-        #pragma unroll
-        for (int m = 0; m < kResidentStateRowBlocks; ++m) {
-            #pragma unroll
-            for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
-                Tensor state_block = local_tile(
-                    resident_s_acc_T,
-                    make_shape(Int<16>{}, Int<16>{}),
-                    make_coord(m, resident_warp_id * kValueBlocksPerWarp + bi));
-                copy(
-                    resident_load_c,
-                    resident_thr_load_c.partition_S(state_block),
-                    resident_thr_load_c.retile_D(resident_state[bi][m]));
-            }
-        }
-
-        for (int t = 0; t < t_tiles; ++t) {
+        auto run_tile = [&]<bool StoreFinalFP32>(int t) {
             load_pipeline.consumer_wait(load_read);
             int load_stage = load_read.index();
             int out_stage = out_write.index();
@@ -475,9 +484,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             Tensor g_total = make_tensor(make_smem_ptr(shared_storage.input[load_stage].g_total.begin()), GTotalLayout{});
             Tensor INV = make_tensor(make_smem_ptr(shared_storage.input[load_stage].INV.begin()), LMLayout{});
             Tensor Mqk = make_tensor(make_smem_ptr(shared_storage.input[load_stage].Mqk.begin()), LMLayout{});
-
-            Tensor s_acc = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), StateSmemLayout{});
-            Tensor s_acc_T = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TransposedStateSmemLayout{});
 
             // Fused MMA: v_sub, v_beta, U=INV@v, out=q@s, out+=Mqk@U, s_acc_update
             // Each warp handles VD / 4 value columns in 16-column blocks.
@@ -511,12 +517,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             auto smem_tiled_store_C = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, BF16>{}, mma);
             auto smem_thr_store_C   = smem_tiled_store_C.get_slice(lane_id);
 
-            // C load/store transposed (for Phase 6 state access via s_acc_T)
-            auto smem_tiled_store_C_T = make_tiled_copy_C(Copy_Atom<SM90_U16x8_STSM_T, BF16>{}, mma);
-            auto smem_thr_store_C_T   = smem_tiled_store_C_T.get_slice(lane_id);
-
             Tensor A_ref = local_tile(k_decayed, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
-            Tensor B_ref = local_tile(s_acc, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
+            Tensor B_ref = local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
             Tensor C_ref = local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
 
             Tensor tCrAi_k = make_fragment_like<BF16>(thr_mma.partition_fragment_A(A_ref));
@@ -684,6 +686,10 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             AFragT ring_A_kr[PREFETCH];
             float ring_g0[PREFETCH], ring_g1[PREFETCH];
+            auto state_coord = make_identity_tensor(make_shape(Int<16>{}, Int<16>{}));
+            auto tCcState = thr_mma.partition_C(state_coord);
+            int state_idx = seq_idx * H + head_idx;
+            auto* final_state = static_cast<float*>(final_state_raw_ptr);
 
             #pragma unroll
             for (int i = 0; i < PREFETCH; ++i) {
@@ -720,38 +726,116 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 #pragma unroll
                 for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
                     auto& state_fragment = resident_state[bi][m];
+                    int value_base = v_idx * VD + (resident_warp_id * kValueBlocksPerWarp + bi) * 16;
+
                     #pragma unroll
                     for (int a = 0; a < 2; ++a) {
                         #pragma unroll
                         for (int d = 0; d < 2; ++d) {
                             auto c0 = make_coord(make_coord(a, 0), 0, d);
                             auto c1 = make_coord(make_coord(a, 1), 0, d);
-                            state_fragment(c0) = BF16(bf16_to_f32(state_fragment(c0)) * g0 + u_acc[bi](c0));
-                            state_fragment(c1) = BF16(bf16_to_f32(state_fragment(c1)) * g1 + u_acc[bi](c1));
-                        }
-                    }
-
-                    // The store warp observes the last output-stage commit only
-                    // after these writes and the following shared-memory fence.
-                    if constexpr (HasStateOut) {
-                        if (t + 1 == t_tiles) {
-                            Tensor s_block = local_tile(
-                                s_acc_T,
-                                make_shape(Int<16>{}, Int<16>{}),
-                                make_coord(m, warp_id * kValueBlocksPerWarp + bi));
-                            copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_fragment), smem_thr_store_C_T.partition_D(s_block));
+                            float h0 = bf16_to_f32(state_fragment(c0)) * g0 + u_acc[bi](c0);
+                            float h1 = bf16_to_f32(state_fragment(c1)) * g1 + u_acc[bi](c1);
+                            if constexpr (StoreFinalFP32) {
+                                // Export raw FP32 before rounding resident H.
+                                auto coord0 = tCcState(c0);
+                                auto coord1 = tCcState(c1);
+                                int key0 = m * 16 + int(get<0>(coord0));
+                                int key1 = m * 16 + int(get<0>(coord1));
+                                int value0 = value_base + int(get<1>(coord0));
+                                int value1 = value_base + int(get<1>(coord1));
+                                int64_t offset0 = (int64_t(state_idx) * D + value0) * D + key0;
+                                int64_t offset1 = (int64_t(state_idx) * D + value1) * D + key1;
+                                final_state[offset0] = h0;
+                                final_state[offset1] = h1;
+                            }
+                            state_fragment(c0) = BF16(h0);
+                            state_fragment(c1) = BF16(h1);
                         }
                     }
                 }
             }
             }
             // The collective commit releases this input stage and publishes
-            // both the output tile and an optional final-state spill.
+            // the output tile.
             cutlass::arch::fence_view_async_shared();
             store_pipeline.producer_commit(out_write);
             load_pipeline.consumer_release(load_read);
             ++load_read;
             ++out_write;
+        };
+
+        // Peel the final tile so steady-state iterations contain no H stores.
+        if constexpr (HasStateOut && StateFP32) {
+            for (int t = 0; t + 1 < t_tiles; ++t) {
+                run_tile.template operator()<false>(t);
+            }
+            if (t_tiles > 0) {
+                run_tile.template operator()<true>(t_tiles - 1);
+            }
+        } else {
+            for (int t = 0; t < t_tiles; ++t) {
+                run_tile.template operator()<false>(t);
+            }
+        }
+
+        if constexpr (HasStateOut && !StateFP32) {
+            int state_idx = seq_idx * H + head_idx;
+            int value_base = v_idx * VD +
+                resident_warp_id * kValueBlocksPerWarp * 16 +
+                resident_lane_id / 4;
+            int key_lane = (resident_lane_id % 4) * 2;
+
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    auto const* source = reinterpret_cast<uint32_t const*>(&resident_state[bi][m](0));
+
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        uint32_t transposed;
+                        // MOVM makes this a contiguous K pair in H[V,K].
+                        SM75_U32x1_MOVM_T::copy(source[i], transposed);
+                        int value = value_base + bi * 16 + (i / 2) * 8;
+                        int key = m * 16 + key_lane + (i % 2) * 8;
+                        int64_t offset = (int64_t(state_idx) * D + value) * D + key;
+
+                        *reinterpret_cast<uint32_t*>(static_cast<BF16*>(final_state_raw_ptr) + offset) = transposed;
+                    }
+                }
+            }
+        }
+    }
+
+    if constexpr (HasStateOut && StateFP32) {
+        // Empty sequences skip the MMA loop; the store warp exports H0.
+        if (warp_role == WarpRole::STORE && t_tiles == 0) {
+            int state_idx = seq_idx * H + head_idx;
+            int64_t offset =
+                (int64_t(state_idx) * D + v_idx * VD) * D;
+            auto* final_state =
+                static_cast<float2*>(final_state_raw_ptr) + offset / 2;
+
+            for (int i = resident_lane_id; i < VD * D / 2;
+                 i += kWarpSize) {
+                float2 state = make_float2(0.0f, 0.0f);
+                if constexpr (HasStateIn) {
+                    using FP32StateSmemLayout =
+                        typename Layouts::FP32StateSmemLayout;
+                    Tensor staged_state = make_tensor(
+                        make_smem_ptr(reinterpret_cast<float*>(
+                            shared_storage.state_staging)),
+                        FP32StateSmemLayout{});
+                    int value = i / (D / 2);
+                    int key = i % (D / 2) * 2;
+                    state.x = staged_state(value, key);
+                    state.y = staged_state(value, key + 1);
+                    state.x = bf16_to_f32(BF16(state.x));
+                    state.y = bf16_to_f32(BF16(state.y));
+                }
+                final_state[i] = state;
+            }
         }
     }
 
@@ -795,55 +879,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             ++out_read;
         }
 
-        if constexpr (HasStateOut && !StateFP32) {
-            // BF16 state: TMA store directly from state_acc
-            Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
-            Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_final.layout())));
-            Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
-
-            auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_store_final_state,
-                cta_tma_store_state.partition_S(s_state),
-                cta_tma_store_state.partition_D(g_final_tile)
-            );
-            tma_store_arrive();
-        }
-    }
-
-    if constexpr (HasStateOut && StateFP32) {
-        // FP32 state: all threads sync, convert bf16->fp32, then STORE warp does TMA
-        using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
-        using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
-
-        __syncthreads();  // all warps sync — pipeline smem now free
-
-        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D, NumThreads>(
-            shared_storage.state_acc.begin(),
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            threadIdx.x);
-        cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
-        __syncthreads();  // conversion complete
-
-        if (warp_role == WarpRole::STORE && lane_predicate) {
-            Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
-            Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_final.layout())));
-            Tensor s_fp32 = make_tensor(
-                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
-                TMAFP32StateSmemLayout{});
-
-            auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_store_final_state,
-                cta_tma_store_state.partition_S(s_fp32),
-                cta_tma_store_state.partition_D(g_final_tile)
-            );
-            tma_store_arrive();
-        }
     }
 
 }
