@@ -304,7 +304,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         cutlass::arch::fence_view_async_shared();
     }
 
-    // Each MMA warp owns VD / 4 value columns of resident H.T.
+    // Load the initial state once into BF16 C fragments; each MMA warp owns
+    // VD / 4 value columns and keeps them resident across the chunk loop.
     auto resident_mma = make_tiled_mma(
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
         Layout<Shape<_1,_1>>{},
@@ -325,7 +326,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     ResidentStateFragment
         resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
 
-    // MMA warp loads initial state
     if (warp_role == WarpRole::MMA) {
         if constexpr (HasStateIn && !StateFP32) {
             Tensor staged_state_t = make_tensor(
@@ -400,7 +400,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         LoadPipelineState load_write = cutlass::make_producer_start_state<LoadPipeline>();
         auto cta_tma_load_v = tma_load_v.get_slice(Int<0>{});
         auto cta_tma_load_beta = tma_load_beta.get_slice(Int<0>{});
-
         for (int t = 0; t < t_tiles; ++t) {
             load_pipeline.producer_acquire(load_write);
             using LoadBarrierType = typename LoadPipeline::ProducerBarrierType;
@@ -409,11 +408,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             int ws_idx = head_idx * total_tiles + tile_base + t;
 
             // TMA load v
-            auto v_off = g_v.layout()(
-                head_idx, int(bos) + t * CHUNK, v_idx * VD);
+            auto v_off = g_v.layout()(head_idx, int(bos) + t * CHUNK, v_idx * VD);
             Tensor g_v_tile = make_tensor(g_v.data() + v_off,
-                make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}),
-                            stride(g_v.layout())));
+                make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}), stride(g_v.layout())));
             Tensor s_v_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].v.begin()), TMAVOLayout{});
             cute::copy(tma_load_v.with(*tma_barrier),
                 cta_tma_load_v.partition_S(g_v_tile), cta_tma_load_v.partition_D(s_v_tile));
@@ -471,8 +468,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         LoadPipelineState load_read;
         StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
         int compute_tid = threadIdx.x;
-
-        // Resident H.T remains in these BF16 C fragments for the full loop.
 
         auto run_tile = [&]<bool StoreFinalFP32>(int t) {
             load_pipeline.consumer_wait(load_read);
@@ -543,14 +538,13 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             using AFragT = decltype(thr_mma.partition_fragment_A(A_ref));
             using BFragT_u = decltype(thr_mma.partition_fragment_B(B_ref));
 
-            AccFragT u_acc[kValueBlocksPerWarp],
-                out_acc[kValueBlocksPerWarp];
+            AccFragT u_acc[kValueBlocksPerWarp], out_acc[kValueBlocksPerWarp];
             #pragma unroll
             for (int i = 0; i < kValueBlocksPerWarp; ++i) { u_acc[i] = thr_mma.make_fragment_C(tCrC_ref); clear(u_acc[i]); }
             #pragma unroll
             for (int i = 0; i < kValueBlocksPerWarp; ++i) { out_acc[i] = thr_mma.make_fragment_C(tCrC_ref); clear(out_acc[i]); }
 
-            // ======== Phase 1: Dual GEMM k@s and q@s (k-loop, 2 blocks per warp) ========
+            // ======== Phase 1: Dual GEMM k@s and q@s ========
             constexpr int K_BLOCKS = decltype(cute::size<1>(k_decayed))::value / 16;
 
             {
@@ -564,7 +558,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 cute::transform(tCrAi_k, tCrA_k, cute::identity{});
                 cute::transform(tCrAi_q, tCrA_q, cute::identity{});
                 movm_transpose_c_to_b_16x16(resident_state[0][k], tCrB);
-
                 gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB(_,_,Int<0>{}), u_acc[0]);
                 gemm(thr_mma, tCrA_q(_,_,Int<0>{}), tCrB(_,_,Int<0>{}), out_acc[0]);
 
@@ -682,7 +675,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             // ======== Phase 6: s_acc update ========
             // s_acc[D, VD] = s_acc * g_total +
-            //                  k_restored_t[D, 16] @ U[16, VD]
+            //                 k_restored_t[D, 16] @ U[16, VD]
             // Each warp updates its VD/4 value columns.
             // U is already in tCrB_u_arr[0..1] as B operands (from Phase 4 MOVM_T)
             constexpr int PREFETCH = 1;
@@ -744,6 +737,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                             float h0 = bf16_to_f32(state_fragment(c0)) * g0 + u_acc[bi](c0);
                             float h1 = bf16_to_f32(state_fragment(c1)) * g1 + u_acc[bi](c1);
                             if constexpr (StoreFinalFP32) {
+                                // Export raw FP32 before rounding resident H.
                                 auto coord0 = tCcState(c0);
                                 auto coord1 = tCcState(c1);
                                 int key0 = m * 16 + int(get<0>(coord0));
@@ -771,6 +765,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             ++out_write;
         };
 
+        // Peel the final tile so steady-state iterations contain no H stores.
         if constexpr (HasStateOut && StateFP32) {
             for (int t = 0; t + 1 < t_tiles; ++t) {
                 run_tile.template operator()<false>(t);
@@ -814,6 +809,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     }
 
     if constexpr (HasStateOut && StateFP32) {
+        // Empty sequences skip the MMA loop; the store warp exports H0.
         if (warp_role == WarpRole::STORE && t_tiles == 0) {
             int state_idx = seq_idx * H + head_idx;
             int64_t offset =
@@ -856,22 +852,19 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             if (actual_len < CHUNK) {
                 // Manual store for tail tile to avoid overwriting next sequence
-                // Only one thread (lane_predicate) runs here, so loop over all D
+                // Only one thread runs here, so loop over this V slice.
                 Tensor s_out = make_tensor(make_smem_ptr(out_stage_ptr), VOLayout{});
                 for (int row = 0; row < actual_len; ++row) {
-                    int64_t global_base = (bos + t * CHUNK + row) * H * D +
-                        head_idx * D + v_idx * VD;
+                    int64_t global_base = (bos + t * CHUNK + row) * H * D + head_idx * D + v_idx * VD;
                     for (int col = 0; col < VD; ++col) {
                         out_raw_ptr[global_base + col] = s_out(row, col);
                     }
                 }
             } else {
                 // TMA store for full tiles
-                auto out_off = g_out.layout()(
-                    head_idx, int(bos) + t * CHUNK, v_idx * VD);
+                auto out_off = g_out.layout()(head_idx, int(bos) + t * CHUNK, v_idx * VD);
                 Tensor g_out_tile = make_tensor(g_out.data() + out_off,
-                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}),
-                                stride(g_out.layout())));
+                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}), stride(g_out.layout())));
                 Tensor s_out_tile = make_tensor(make_smem_ptr(out_stage_ptr), TMAVOLayout{});
                 cute::copy(
                     tma_store_out,

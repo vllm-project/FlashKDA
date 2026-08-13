@@ -131,7 +131,6 @@ void launch_fwd(
     };
     auto tma_load_initial_state = make_state_tma_load(
         TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
-
     // ===== Launch Kernel 1 (prepare) =====
 #if BLOCK_LEVEL_K1 >= 0
     {
@@ -168,6 +167,8 @@ void launch_fwd(
         dim3 block_k2(kK2Threads);
 
         if (use_vsplit) {
+            // Keep the default path's host launch overhead unchanged: split
+            // TensorMaps are constructed only when this path is requested.
             auto tma_load_v_vsplit = make_tma_copy(
                 SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{});
             auto tma_store_out_vsplit = make_tma_copy(
