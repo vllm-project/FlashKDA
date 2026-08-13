@@ -475,7 +475,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
         // Resident H.T remains in these BF16 C fragments for the full loop.
 
-        for (int t = 0; t < t_tiles; ++t) {
+        auto run_tile = [&]<bool StoreFinalFP32>(int t) {
             load_pipeline.consumer_wait(load_read);
             int load_stage = load_read.index();
             int out_stage = out_write.index();
@@ -694,6 +694,10 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             AFragT ring_A_kr[PREFETCH];
             float ring_g0[PREFETCH], ring_g1[PREFETCH];
+            auto state_coord = make_identity_tensor(make_shape(Int<16>{}, Int<16>{}));
+            auto tCcState = thr_mma.partition_C(state_coord);
+            int state_idx = seq_idx * H + head_idx;
+            auto* final_state = static_cast<float*>(final_state_raw_ptr);
 
             #pragma unroll
             for (int i = 0; i < PREFETCH; ++i) {
@@ -730,14 +734,30 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 #pragma unroll
                 for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
                     auto& state_fragment = resident_state[bi][m];
+                    int value_base = v_idx * VD + (resident_warp_id * kValueBlocksPerWarp + bi) * 16;
+
                     #pragma unroll
                     for (int a = 0; a < 2; ++a) {
                         #pragma unroll
                         for (int d = 0; d < 2; ++d) {
                             auto c0 = make_coord(make_coord(a, 0), 0, d);
                             auto c1 = make_coord(make_coord(a, 1), 0, d);
-                            state_fragment(c0) = BF16(bf16_to_f32(state_fragment(c0)) * g0 + u_acc[bi](c0));
-                            state_fragment(c1) = BF16(bf16_to_f32(state_fragment(c1)) * g1 + u_acc[bi](c1));
+                            float h0 = bf16_to_f32(state_fragment(c0)) * g0 + u_acc[bi](c0);
+                            float h1 = bf16_to_f32(state_fragment(c1)) * g1 + u_acc[bi](c1);
+                            if constexpr (StoreFinalFP32) {
+                                auto coord0 = tCcState(c0);
+                                auto coord1 = tCcState(c1);
+                                int key0 = m * 16 + int(get<0>(coord0));
+                                int key1 = m * 16 + int(get<0>(coord1));
+                                int value0 = value_base + int(get<1>(coord0));
+                                int value1 = value_base + int(get<1>(coord1));
+                                int64_t offset0 = (int64_t(state_idx) * D + value0) * D + key0;
+                                int64_t offset1 = (int64_t(state_idx) * D + value1) * D + key1;
+                                final_state[offset0] = h0;
+                                final_state[offset1] = h1;
+                            }
+                            state_fragment(c0) = BF16(h0);
+                            state_fragment(c1) = BF16(h1);
                         }
                     }
                 }
@@ -750,9 +770,22 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             load_pipeline.consumer_release(load_read);
             ++load_read;
             ++out_write;
+        };
+
+        if constexpr (HasStateOut && StateFP32) {
+            for (int t = 0; t + 1 < t_tiles; ++t) {
+                run_tile.template operator()<false>(t);
+            }
+            if (t_tiles > 0) {
+                run_tile.template operator()<true>(t_tiles - 1);
+            }
+        } else {
+            for (int t = 0; t < t_tiles; ++t) {
+                run_tile.template operator()<false>(t);
+            }
         }
 
-        if constexpr (HasStateOut) {
+        if constexpr (HasStateOut && !StateFP32) {
             int state_idx = seq_idx * H + head_idx;
             int value_base = v_idx * VD +
                 resident_warp_id * kValueBlocksPerWarp * 16 +
@@ -774,18 +807,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                         int key = m * 16 + key_lane + (i % 2) * 8;
                         int64_t offset = (int64_t(state_idx) * D + value) * D + key;
 
-                        if constexpr (StateFP32) {
-                            // Preserve recurrent BF16 rounding; widen for I/O.
-                            int2 tmp;
-                            asm volatile(
-                                "shl.b32 %0, %2, 16;\n"
-                                "and.b32 %1, %2, 0xffff0000;\n"
-                                : "=r"(tmp.x), "=r"(tmp.y)
-                                : "r"(transposed));
-                            *reinterpret_cast<int2*>(static_cast<float*>(final_state_raw_ptr) + offset) = tmp;
-                        } else {
-                            *reinterpret_cast<uint32_t*>(static_cast<BF16*>(final_state_raw_ptr) + offset) = transposed;
-                        }
+                        *reinterpret_cast<uint32_t*>(static_cast<BF16*>(final_state_raw_ptr) + offset) = transposed;
                     }
                 }
             }
