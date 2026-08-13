@@ -181,8 +181,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     constexpr int kWarpSize = 32;
     constexpr int kComputeThreads = 128;
     constexpr int kVSlices = D / VD;
-    constexpr int kValueBlocksPerWarp =
-        VD / ((kComputeThreads / kWarpSize) * 16);
+    constexpr int kValueBlocksPerWarp = VD / ((kComputeThreads / kWarpSize) * 16);
     static_assert(kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
 
     // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
@@ -810,6 +809,36 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                         *reinterpret_cast<uint32_t*>(static_cast<BF16*>(final_state_raw_ptr) + offset) = transposed;
                     }
                 }
+            }
+        }
+    }
+
+    if constexpr (HasStateOut && StateFP32) {
+        if (warp_role == WarpRole::STORE && t_tiles == 0) {
+            int state_idx = seq_idx * H + head_idx;
+            int64_t offset =
+                (int64_t(state_idx) * D + v_idx * VD) * D;
+            auto* final_state =
+                static_cast<float2*>(final_state_raw_ptr) + offset / 2;
+
+            for (int i = resident_lane_id; i < VD * D / 2;
+                 i += kWarpSize) {
+                float2 state = make_float2(0.0f, 0.0f);
+                if constexpr (HasStateIn) {
+                    using FP32StateSmemLayout =
+                        typename Layouts::FP32StateSmemLayout;
+                    Tensor staged_state = make_tensor(
+                        make_smem_ptr(reinterpret_cast<float*>(
+                            shared_storage.state_staging)),
+                        FP32StateSmemLayout{});
+                    int value = i / (D / 2);
+                    int key = i % (D / 2) * 2;
+                    state.x = staged_state(value, key);
+                    state.y = staged_state(value, key + 1);
+                    state.x = bf16_to_f32(BF16(state.x));
+                    state.y = bf16_to_f32(BF16(state.y));
+                }
+                final_state[i] = state;
             }
         }
     }
