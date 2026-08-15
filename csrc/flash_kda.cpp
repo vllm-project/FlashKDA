@@ -213,16 +213,33 @@ void fwd(
         STD_TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
                         "final_state must be [N, H, D, D]");
     }
+    int64_t num_checkpoints = 1;
     if (has_checkpoint) {
         auto& cs = checkpoint_state.value();
         auto& co = checkpoint_offsets.value();
         STD_TORCH_CHECK(
-            cs.dim() == 4 && cs.size(0) == N_val && cs.size(1) == H &&
-                cs.size(2) == D && cs.size(3) == D,
-            "checkpoint_state must be [N, H, D, D]");
+            co.dim() == 1 || co.dim() == 2,
+            "checkpoint_offsets must be [N] or [N, K]");
+        num_checkpoints = co.dim() == 1 ? 1 : co.size(1);
         STD_TORCH_CHECK(
-            co.dim() == 1 && co.size(0) == N_val,
-            "checkpoint_offsets must be [N]");
+            num_checkpoints > 0 && num_checkpoints <= 2,
+            "checkpoint_offsets supports one or two checkpoints per sequence");
+        STD_TORCH_CHECK(
+            cs.dim() == co.dim() + 3 && cs.size(0) == N_val,
+            "checkpoint_state rank/prefix must match checkpoint_offsets");
+        STD_TORCH_CHECK(
+            co.size(0) == N_val,
+            "checkpoint_offsets first dimension must be N");
+        if (co.dim() == 2) {
+            STD_TORCH_CHECK(
+                cs.size(1) == num_checkpoints,
+                "checkpoint_state and checkpoint_offsets K must match");
+        }
+        int state_dim = int(cs.dim()) - 3;
+        STD_TORCH_CHECK(
+            cs.size(state_dim) == H && cs.size(state_dim + 1) == D &&
+                cs.size(state_dim + 2) == D,
+            "checkpoint_state suffix must be [H, D, D]");
         STD_TORCH_CHECK(
             co.scalar_type() ==
                 (cu_seqlens_is_int32 ? ScalarType::Int : ScalarType::Long),
@@ -245,7 +262,8 @@ void fwd(
             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
                 initial_state_raw, scale_f, final_state_raw, \
-                checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
+                checkpoint_state_raw, typed_checkpoint_offsets, \
+                int(num_checkpoints), out_ptr, \
                 workspace_ptr, total_tiles, \
                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)

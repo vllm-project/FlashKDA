@@ -24,6 +24,7 @@ void launch_fwd(
     void* final_state_ptr,
     float* checkpoint_state_ptr,
     SeqlenT const* checkpoint_offsets_ptr,
+    int num_checkpoints,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
     int total_tiles,
@@ -218,6 +219,7 @@ void launch_fwd(
                 tma_store_final_state_vsplit,
                 tma_store_out_vsplit,
                 out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
+                num_checkpoints,
                 T_total, H, N, cu_seqlens_ptr, total_tiles,
                 ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
             return;
@@ -248,6 +250,7 @@ void launch_fwd(
             tma_store_final_state,
             tma_store_out,
             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
+            num_checkpoints,
             T_total, H, N, cu_seqlens_ptr, total_tiles,
             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );
@@ -261,7 +264,7 @@ void launch_fwd(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
-        float*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
+        float*, SEQLEN_T const*, int, cutlass::bfloat16_t*, void*, \
         int, int, int, int, \
         SEQLEN_T const*, float const*, float const*, float, bool, \
         cudaStream_t);

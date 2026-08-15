@@ -149,6 +149,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     cutlass::bfloat16_t* out_raw_ptr,
     float* checkpoint_state_ptr,
     SeqlenT const* checkpoint_offsets,
+    int num_checkpoints,
     int T_total,
     int H,
     int N,
@@ -447,11 +448,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             resident_thr_mma.make_fragment_C(resident_c_ref)));
         constexpr int kResidentStateRowBlocks = D / 16;
         ResidentStateFragment resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
-        SeqlenT checkpoint_offset = 0;
-        if constexpr (HasCheckpoint) {
-            checkpoint_offset = checkpoint_offsets[seq_idx];
-        }
-
         #pragma unroll
         for (int m = 0; m < kResidentStateRowBlocks; ++m) {
             #pragma unroll
@@ -485,9 +481,17 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             Tensor s_acc = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), StateSmemLayout{});
             Tensor s_acc_T = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TransposedStateSmemLayout{});
+            int checkpoint_slot = -1;
             bool export_checkpoint = false;
             if constexpr (HasCheckpoint) {
-                export_checkpoint = checkpoint_offset == (t + 1) * CHUNK;
+                for (int slot = 0; slot < num_checkpoints; ++slot) {
+                    if (checkpoint_offsets[seq_idx * num_checkpoints + slot] ==
+                        (t + 1) * CHUNK) {
+                        checkpoint_slot = slot;
+                        break;
+                    }
+                }
+                export_checkpoint = checkpoint_slot >= 0;
             }
 
             // Fused MMA: v_sub, v_beta, U=INV@v, out=q@s, out+=Mqk@U, s_acc_update
@@ -769,7 +773,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                     cutlass::arch::NamedBarrier checkpoint_barrier(kComputeThreads, 0);
                     checkpoint_barrier.arrive_and_wait();
                     const int64_t checkpoint_base =
-                        (int64_t(seq_idx * H + head_idx) * D +
+                        (int64_t(
+                             (seq_idx * num_checkpoints + checkpoint_slot) * H +
+                             head_idx) * D +
                          v_idx * VD) * D;
                     for (int state_idx = compute_tid; state_idx < VD * D;
                          state_idx += kComputeThreads) {

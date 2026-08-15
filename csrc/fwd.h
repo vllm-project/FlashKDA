@@ -22,6 +22,7 @@ void launch_fwd(
     void* final_state_ptr,
     float* checkpoint_state_ptr,
     SeqlenT const* checkpoint_offsets_ptr,
+    int num_checkpoints,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
     int total_tiles,
