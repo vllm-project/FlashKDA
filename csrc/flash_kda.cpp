@@ -42,7 +42,9 @@ void fwd(
     double lower_bound,
     std::optional<Tensor> initial_state,
     std::optional<Tensor> final_state,
-    std::optional<Tensor> cu_seqlens
+    std::optional<Tensor> cu_seqlens,
+    std::optional<Tensor> checkpoint_state,
+    std::optional<Tensor> checkpoint_offsets
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
@@ -58,6 +60,10 @@ void fwd(
     // Validate state tensors if present
     bool has_state_in = initial_state.has_value();
     bool has_state_out = final_state.has_value();
+    bool has_checkpoint = checkpoint_state.has_value();
+    STD_TORCH_CHECK(
+        has_checkpoint == checkpoint_offsets.has_value(),
+        "checkpoint_state and checkpoint_offsets must be provided together");
     bool state_fp32 = false;
 
     if (has_state_in) {
@@ -73,6 +79,23 @@ void fwd(
         STD_TORCH_CHECK(fs.scalar_type() == ScalarType::BFloat16 || fs.scalar_type() == ScalarType::Float,
                         "final_state must be bfloat16 or float32");
         if (fs.scalar_type() == ScalarType::Float) state_fp32 = true;
+    }
+    if (has_checkpoint) {
+        auto& cs = checkpoint_state.value();
+        auto& co = checkpoint_offsets.value();
+        STD_TORCH_CHECK(
+            cs.is_cuda() && cs.is_contiguous(),
+            "checkpoint_state must be a contiguous CUDA tensor");
+        STD_TORCH_CHECK(
+            cs.scalar_type() == ScalarType::Float,
+            "checkpoint_state must be float32");
+        STD_TORCH_CHECK(
+            co.is_cuda() && co.is_contiguous(),
+            "checkpoint_offsets must be a contiguous CUDA tensor");
+        STD_TORCH_CHECK(
+            co.scalar_type() == ScalarType::Int ||
+                co.scalar_type() == ScalarType::Long,
+            "checkpoint_offsets must be int32 or int64");
     }
     // If both present, dtypes must match
     if (has_state_in && has_state_out) {
@@ -138,6 +161,9 @@ void fwd(
     // Get state pointers (nullptr if not present)
     void const* initial_state_raw = has_state_in ? initial_state->const_data_ptr() : nullptr;
     void* final_state_raw = has_state_out ? final_state->mutable_data_ptr() : nullptr;
+    float* checkpoint_state_raw = has_checkpoint
+        ? static_cast<float*>(checkpoint_state->mutable_data_ptr())
+        : nullptr;
 
     // Determine cu_seqlens and N
     bool is_varlen = cu_seqlens.has_value();
@@ -187,6 +213,21 @@ void fwd(
         STD_TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
                         "final_state must be [N, H, D, D]");
     }
+    if (has_checkpoint) {
+        auto& cs = checkpoint_state.value();
+        auto& co = checkpoint_offsets.value();
+        STD_TORCH_CHECK(
+            cs.dim() == 4 && cs.size(0) == N_val && cs.size(1) == H &&
+                cs.size(2) == D && cs.size(3) == D,
+            "checkpoint_state must be [N, H, D, D]");
+        STD_TORCH_CHECK(
+            co.dim() == 1 && co.size(0) == N_val,
+            "checkpoint_offsets must be [N]");
+        STD_TORCH_CHECK(
+            co.scalar_type() ==
+                (cu_seqlens_is_int32 ? ScalarType::Int : ScalarType::Long),
+            "checkpoint_offsets and cu_seqlens must have matching dtypes");
+    }
 
     int total_tiles;
     if (is_varlen) {
@@ -196,35 +237,48 @@ void fwd(
     }
 
     auto dispatch = [&](auto typed_cu_seqlens) {
-        #define LAUNCH(HI, HO, FP32, VL) \
-            launch_fwd<128, HI, HO, FP32, VL>( \
+        using SeqlenPtr = decltype(typed_cu_seqlens);
+        SeqlenPtr typed_checkpoint_offsets = has_checkpoint
+            ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
+            : nullptr;
+        #define LAUNCH(HI, HO, FP32, CKPT, VL) \
+            launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
-                initial_state_raw, scale_f, final_state_raw, out_ptr, \
+                initial_state_raw, scale_f, final_state_raw, \
+                checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
 
-        #define DISPATCH_STATE(VL) \
+        #define DISPATCH_STATE(CKPT, VL) \
             if (!has_state_in && !has_state_out) { \
-                LAUNCH(false, false, false, VL); \
+                LAUNCH(false, false, false, CKPT, VL); \
             } else if (has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(true, true, true, VL); \
+                LAUNCH(true, true, true, CKPT, VL); \
             } else if (has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(true, true, false, VL); \
+                LAUNCH(true, true, false, CKPT, VL); \
             } else if (!has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(false, true, true, VL); \
+                LAUNCH(false, true, true, CKPT, VL); \
             } else if (!has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(false, true, false, VL); \
+                LAUNCH(false, true, false, CKPT, VL); \
             } else if (has_state_in && !has_state_out && state_fp32) { \
-                LAUNCH(true, false, true, VL); \
+                LAUNCH(true, false, true, CKPT, VL); \
             } else { \
-                LAUNCH(true, false, false, VL); \
+                LAUNCH(true, false, false, CKPT, VL); \
             }
 
         if (is_varlen) {
-            DISPATCH_STATE(true);
+            if (has_checkpoint) {
+                DISPATCH_STATE(true, true);
+            } else {
+                DISPATCH_STATE(false, true);
+            }
         } else {
-            DISPATCH_STATE(false);
+            if (has_checkpoint) {
+                DISPATCH_STATE(true, false);
+            } else {
+                DISPATCH_STATE(false, false);
+            }
         }
 
         #undef DISPATCH_STATE
