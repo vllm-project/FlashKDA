@@ -1,5 +1,4 @@
 import torch
-import ctypes
 from torch.utils.cpp_extension import load_inline
 
 # ============================================================
@@ -37,44 +36,6 @@ sigmoid_ext = load_inline(
     extra_cuda_cflags=['-O2'],
     verbose=False,
 )
-
-# ============================================================
-# cuBLAS fp16 accumulation GEMM
-# ============================================================
-_cublas = ctypes.CDLL('libcublas.so')
-_cublas_handle = ctypes.c_void_p()
-assert _cublas.cublasCreate_v2(ctypes.byref(_cublas_handle)) == 0
-
-CUBLAS_OP_N = 0
-CUDA_R_16F = 2
-CUBLAS_COMPUTE_16F = 64
-CUBLAS_GEMM_DEFAULT = 0
-
-_alpha_fp16 = ctypes.c_ushort(0x3C00)  # 1.0 in fp16
-_beta_fp16  = ctypes.c_ushort(0x0000)  # 0.0 in fp16
-
-
-def matmul_fp16acc(a, b):
-    """C = A @ B using cublasGemmEx with CUBLAS_COMPUTE_16F (fp16 accumulation)."""
-    M, K = a.shape
-    K2, N = b.shape
-    assert K == K2
-    c = torch.zeros(M, N, dtype=torch.float16, device='cuda')
-    status = _cublas.cublasGemmEx(
-        _cublas_handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        ctypes.c_int(N), ctypes.c_int(M), ctypes.c_int(K),
-        ctypes.byref(_alpha_fp16),
-        ctypes.c_void_p(b.data_ptr()), ctypes.c_int(CUDA_R_16F), ctypes.c_int(N),
-        ctypes.c_void_p(a.data_ptr()), ctypes.c_int(CUDA_R_16F), ctypes.c_int(K),
-        ctypes.byref(_beta_fp16),
-        ctypes.c_void_p(c.data_ptr()), ctypes.c_int(CUDA_R_16F), ctypes.c_int(N),
-        ctypes.c_int(CUBLAS_COMPUTE_16F),
-        ctypes.c_int(CUBLAS_GEMM_DEFAULT),
-    )
-    assert status == 0, f"cublasGemmEx failed: {status}"
-    return c
-
 
 # ============================================================
 # Numeric helpers
@@ -115,6 +76,50 @@ def l2_normalize_kernel_match(x):
 
     inv_norm = torch.rsqrt(partials[..., 0:1] + 1e-6)
     return (x_f32 * inv_norm).to(x.dtype)
+
+
+# ============================================================
+# (I + L)^-1: 8x8 fp32 forward substitution + 16x16 bf16 block merge.
+# Mirrors the kernel's inv_fwd_subst_fused_1warp bit-for-bit (replaces the fp16
+# Neumann series, which loses accuracy when |L| -> 1 near-collinear keys).
+# ============================================================
+
+def inv_fwd_subst_16(L):
+    """(I + L)^-1 for strictly-lower fp32 L [16, 16] or [N, 16, 16], bf16 out."""
+    squeeze = L.dim() == 2
+    if squeeze:
+        L = L.unsqueeze(0)
+    n = L.shape[0]
+    device = L.device
+    seed = L  # strictly-lower fp32; X = I + L = I + seed
+
+    # Diagonal 8x8 blocks inverted by fp32 forward substitution
+    # (kernel-exact FMA order: rank-1 updates below the pivot row,
+    # pivot row broadcast from its finalized values at step s).
+    inv8 = torch.cat([seed[..., :8, :8], seed[..., 8:, 8:]], dim=0)
+    idx8 = torch.arange(8, device=device)
+    inv8[:, idx8, idx8] = 1.0
+    for s in range(7):
+        row_scale = -inv8[:, :, s]  # [2N, 8]
+        for p in range(s):
+            inv8[:, s + 1:, p] = fp32_fma(
+                inv8[:, s + 1:, p], row_scale[:, s + 1:], inv8[:, s, p:p + 1])
+        inv8[:, s + 1:, s] = row_scale[:, s + 1:]
+
+    # Merge: P = diag(A^-1, B^-1) bf16, M = [0 0; C 0] bf16 (the kernel
+    # quantizes fp32 -> bf16 only at the HMMA inputs), dc = P @ M (fp32 acc),
+    # o = bf16(-dc) @ P (fp32 acc), INV = P + bf16(o) (disjoint blocks).
+    P = torch.zeros(n, 16, 16, dtype=torch.bfloat16, device=device)
+    P[:, :8, :8] = inv8[:n].to(torch.bfloat16)
+    P[:, 8:, 8:] = inv8[n:].to(torch.bfloat16)
+    M = torch.zeros_like(P)
+    M[:, 8:, :8] = seed[..., 8:, :8].to(torch.bfloat16)
+    INV = torch.empty_like(P)
+    for b in range(n):
+        dc = torch.mm(P[b], M[b], out_dtype=torch.float32)
+        o = torch.mm((-dc).to(torch.bfloat16), P[b], out_dtype=torch.float32)
+        INV[b] = P[b] + o.to(torch.bfloat16)
+    return INV.squeeze(0) if squeeze else INV
 
 
 # ============================================================
@@ -208,25 +213,16 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
                 k_inv = k_chunk * neg_g_cumsum_bf16
                 g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
                 k_restored = k_inv * g_total_exp_bf16
-                L = torch.mm(k_decayed, k_inv.t(), out_dtype=torch.float32).to(torch.float16)
+                L = torch.mm(k_decayed, k_inv.t(), out_dtype=torch.float32)
                 Mqk = torch.matmul(q_decayed, k_inv.t())
 
                 # Fuse sigmoid via tanh.approx: beta is bf16 logits
                 beta_activated = sigmoid_ext.sigmoid_tanh_fp32(beta_chunk.to(torch.float32))
                 beta_val_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
-                beta_val_fp16 = beta_activated.to(torch.float16).unsqueeze(-1)
-                L = torch.tril(L, diagonal=-1) * beta_val_fp16
+                L = torch.tril(L, diagonal=-1) * beta_activated.unsqueeze(-1)
                 Mqk = torch.tril(Mqk)
 
-                INV = torch.eye(CHUNK, dtype=torch.float16, device=device) - L
-                L2 = matmul_fp16acc(L, L)
-                INV = INV + matmul_fp16acc(INV, L2)
-                L4 = matmul_fp16acc(L2, L2)
-                INV = INV + matmul_fp16acc(INV, L4)
-                L8 = matmul_fp16acc(L4, L4)
-                INV = INV + matmul_fp16acc(INV, L8)
-
-                INV = INV.to(torch.bfloat16)
+                INV = inv_fwd_subst_16(L)
 
                 state_slice = work_state[seq_idx, h]
                 v_chunk = v_chunk - torch.matmul(k_decayed, state_slice.t())

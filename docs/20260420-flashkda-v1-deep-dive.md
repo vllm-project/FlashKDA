@@ -19,7 +19,7 @@ uses `CHUNK = 16`. This decision is motivated by three considerations:
   intra-chunk rescaling tricks that larger chunk sizes require.
 - **Cheap matrix inversion.** Inverting a `16 × 16` matrix is dramatically
   cheaper than inverting a `64 × 64` one, and the former can be computed
-  directly from a Neumann-series expansion without further decomposition.
+  directly by forward substitution without further decomposition.
 - **SM80-only MMA path.** All `CHUNK = 16` math maps cleanly onto SM80 MMA
   instructions. This keeps the kernel simple and makes it portable across a
   wide range of modern NVIDIA GPUs without relying on architecture-specific
@@ -59,12 +59,12 @@ Several other precision-aware decisions appear inside the kernel:
 - **Sigmoid via `tanh.approx.f32`.** We implement sigmoid using the PTX
   `tanh.approx.f32` instruction, which is both faster and precise enough for
   the gating path.
-- **FP16 matrix inversion.** The `16 × 16` inverse is computed in fp16
-  rather than bf16. As analyzed in [this blog post](https://kexue.fm/archives/11563),
-  the elements of the inverse matrix are bounded within `[-1, 1]`, so fp16's
-  narrower dynamic range is sufficient. Using fp16 avoids the `fp32 → bf16`
-  cast that bf16 MMA would otherwise require and gives the Neumann-series
-  expansion extra headroom, improving the accuracy of the inverse.
+- **Forward-substitution matrix inversion.** The `16 × 16` inverse is computed
+  exactly: the seed `L` stays in fp32 end to end (the `L` GEMM stores its raw
+  fp32 accumulator and the tril/beta masking is done in fp32), the two diagonal
+  `8 × 8` blocks are inverted by fp32 forward substitution, and the
+  off-diagonal block is merged with two bf16-HMMA GEMMs (`dc = P @ M`,
+  `o = (−dc) @ P`, both fp32-accumulate).
 
 ### Accuracy vs. `fla_chunk_kda`
 

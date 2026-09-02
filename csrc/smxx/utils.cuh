@@ -163,7 +163,7 @@ CUTLASS_DEVICE void mma_m16n16_bf16bf16bf16_1warp(
 }
 
 template <class TensorA, class TensorB, class TensorC>
-CUTLASS_DEVICE void mma_m16n16_bf16bf16fp16_1warp(
+CUTLASS_DEVICE void mma_m16n16_bf16bf16fp32_1warp(
     TensorA const& A,
     TensorB const& B,
     TensorC& C,
@@ -177,68 +177,127 @@ CUTLASS_DEVICE void mma_m16n16_bf16bf16fp16_1warp(
 
     if (mma_tid >= int(size(mma))) return;
 
-    using FP16 = cutlass::half_t;
+    // Same accumulation chain as the fp16/bf16-store variants; only the
+    // epilogue differs (raw fp32 accumulator stored elementwise).
+    auto thr_mma = mma.get_slice(mma_tid);
+    Tensor tCsC = thr_mma.partition_C(C);
+    Tensor tCrC = thr_mma.make_fragment_C(tCsC);
+    clear(tCrC);
 
-    auto sC_store_op = [] __device__ (float x) { return FP16(x); };
+    cooperative_gemm(mma_tid, mma, A, B, tCrC, cute::identity{}, cute::identity{}, SM75_U32x4_LDSM_N{}, SM75_U32x4_LDSM_N{});
 
-    cooperative_gemm(mma_tid, mma, 1.0f, A, B, 0.0f, C, cute::identity{}, cute::identity{}, cute::identity{}, sC_store_op, SM75_U32x4_LDSM_N{}, SM75_U32x4_LDSM_N{}, SM75_U32x4_LDSM_N{}, SM90_U32x4_STSM_N{});
+    cute::copy(tCrC, tCsC);
 }
 
-template <class TensorL, class TensorINV_fp16, class TensorINV_bf16>
-CUTLASS_DEVICE void neumann_inv_fused_1warp(
-    TensorL const& L_fp16,
-    TensorINV_fp16 const& INV_fp16,
-    TensorINV_bf16& INV_bf16_out,
+// (I + L)^-1 via 8x8 fp32 forward substitution + 16x16 bf16-HMMA block merge.
+//
+// X = I + L (unit lower triangular, 16x16) is split into 8x8 blocks:
+//   X = [A 0; C B]   =>   X^-1 = [A^-1  0; -(B^-1 C) A^-1  B^-1]
+// The seed L stays fp32 all the way into the forward substitution (no
+// input quantization). The diagonal 8x8 inverses are computed by fp32
+// forward substitution (sequential rank-1 updates, exact FMA order). Unlike
+// the previous fp16 Neumann series (I-L)(I+L^2)(I+L^4)(I+L^8), this never
+// forms L^k intermediates, so it stays accurate for near-collinear keys
+// where |L| -> 1 (the Neumann powers reach ~1e3 there and cancel
+// catastrophically in fp16). The off-diagonal merge reuses the fused HMMA
+// plumbing with bf16 operands and fp32 accumulation, quantizing fp32 ->
+// bf16 only at the HMMA inputs:
+//   P  = [A^-1 0; 0 B^-1]   (bf16, staged into INV_bf16)
+//   M  = [0 0; C 0]         (bf16, staged into M_bf16, C = seed = L)
+//   dc = P @ M              (bf16 HMMA, fp32 acc; rows 8-15 hold B^-1 C)
+//   o  = bf16(-dc) @ P      (negate fp32 -> bf16, then fp32 acc)
+//   INV = P + bf16(o)       (elementwise bf16 add; nonzero blocks disjoint)
+// Result is stored bf16 like before.
+template <class TensorL32, class TensorM, class TensorINV>
+CUTLASS_DEVICE void inv_fwd_subst_fused_1warp(
+    TensorL32 const& L_fp32,
+    TensorM& M_bf16,
+    TensorINV& INV_bf16,
     int tid
 ) {
-    using FP16 = cutlass::half_t;
     using BF16 = cutlass::bfloat16_t;
 
     auto mma = make_tiled_mma(
-        SM80_16x8x16_F16F16F16F16_TN{},
+        SM80_16x8x16_F32BF16BF16F32_TN{},
         Layout<Shape<_1,_1>>{},
         Tile<_16,_16,_16>{}
     );
     if (tid >= int(size(mma))) return;
 
+    // ---- 8x8 forward substitution (fp32, one row per lane) ----
+    // Each 8-lane group handles one diagonal block of seed = L; lane i owns
+    // row i and keeps it in registers. Groups 0/2 do block A (rows 0-7),
+    // groups 1/3 do block B (rows 8-15); the redundant copies keep every
+    // shuffle converged. At step s the finalized pivot row s is broadcast
+    // from its owner lane.
+    const int i = tid & 7;
+    const int row0 = tid & 8;
+    float inv[8];
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        inv[p] = (p < i) ? L_fp32(row0 + i, row0 + p)
+                         : (p == i ? 1.0f : 0.0f);
+    }
+    #pragma unroll
+    for (int s = 0; s < 7; ++s) {
+        const float row_scale = -inv[s];
+        #pragma unroll
+        for (int p = 0; p < s; ++p) {
+            const float pivot = __shfl_sync(0xFFFFFFFFu, inv[p], (tid & ~7) | s);
+            if (i > s) inv[p] = fmaf(row_scale, pivot, inv[p]);
+        }
+        if (i > s) inv[s] = row_scale;
+    }
+
+    // ---- stage P (into INV_bf16) and M (into M_bf16) ----
+    // L_fp32 is read-only here, so no sync is needed before staging.
+    const int group = tid >> 3;
+    if (group == 0) {
+        // P rows 0-7: A^-1 in the left half (zero above the diagonal), 0 right
+        #pragma unroll
+        for (int j = 0; j < 16; ++j)
+            INV_bf16(i, j) = (j < 8) ? BF16(inv[j]) : BF16::bitcast(0);
+    } else if (group == 1) {
+        // P rows 8-15: 0 left, B^-1 in the right half
+        #pragma unroll
+        for (int j = 0; j < 16; ++j)
+            INV_bf16(8 + i, j) = (j < 8) ? BF16::bitcast(0) : BF16(inv[j - 8]);
+    } else if (group == 2) {
+        // M upper half = 0
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) M_bf16(i, j) = BF16::bitcast(0);
+    } else {
+        // M lower half: C = seed in the left half (fp32 -> bf16), 0 right
+        #pragma unroll
+        for (int j = 0; j < 16; ++j)
+            M_bf16(8 + i, j) = (j < 8) ? BF16(L_fp32(8 + i, j)) : BF16::bitcast(0);
+    }
+    __syncwarp();
+
     auto thr_mma = mma.get_slice(tid);
 
-    auto smem_copy_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, FP16>{}, mma);
+    auto smem_copy_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, BF16>{}, mma);
     auto thr_copy_A = smem_copy_A.get_thread_slice(tid);
 
-    Tensor tCrL = thr_mma.partition_fragment_A(L_fp16);
+    Tensor tCrP = thr_mma.partition_fragment_A(INV_bf16);
     {
-        Tensor tmp = make_fragment_like<FP16>(tCrL);
-        copy(smem_copy_A, thr_copy_A.partition_S(L_fp16), thr_copy_A.retile_D(tmp));
-        cute::transform(tmp, tCrL, cute::identity{});
+        Tensor tmp = make_fragment_like<BF16>(tCrP);
+        copy(smem_copy_A, thr_copy_A.partition_S(INV_bf16), thr_copy_A.retile_D(tmp));
+        cute::transform(tmp, tCrP, cute::identity{});
     }
 
-    Tensor tCrINV = thr_mma.partition_fragment_A(INV_fp16);
+    Tensor tCrM = thr_mma.partition_fragment_A(M_bf16);
     {
-        Tensor tmp = make_fragment_like<FP16>(tCrINV);
-        copy(smem_copy_A, thr_copy_A.partition_S(INV_fp16), thr_copy_A.retile_D(tmp));
-        cute::transform(tmp, tCrINV, cute::identity{});
+        Tensor tmp = make_fragment_like<BF16>(tCrM);
+        copy(smem_copy_A, thr_copy_A.partition_S(M_bf16), thr_copy_A.retile_D(tmp));
+        cute::transform(tmp, tCrM, cute::identity{});
     }
 
-    uint32_t* L_a = reinterpret_cast<uint32_t*>(&tCrL(0));
-    uint32_t* INV_a = reinterpret_cast<uint32_t*>(&tCrINV(0));
+    uint32_t* P_a = reinterpret_cast<uint32_t*>(&tCrP(0));
+    uint32_t* M_a = reinterpret_cast<uint32_t*>(&tCrM(0));
 
-    uint32_t Lpow_c[4], Lpow_b[4], INV_c[4], tmp_a[4], mm_c[4];
-
-    auto clear_u32x4 = [](uint32_t* x) {
-        x[0] = x[1] = x[2] = x[3] = 0;
-    };
-
-    auto add_fp16x2_u32x4 = [] (uint32_t* dst, uint32_t const* src) {
-        union U32H2 { uint32_t u; __half2 h2; };
-        U32H2 a0{dst[0]}, b0{src[0]}, a1{dst[1]}, b1{src[1]};
-        U32H2 a2{dst[2]}, b2{src[2]}, a3{dst[3]}, b3{src[3]};
-        a0.h2 = __hadd2(a0.h2, b0.h2);
-        a1.h2 = __hadd2(a1.h2, b1.h2);
-        a2.h2 = __hadd2(a2.h2, b2.h2);
-        a3.h2 = __hadd2(a3.h2, b3.h2);
-        dst[0] = a0.u; dst[1] = a1.u; dst[2] = a2.u; dst[3] = a3.u;
-    };
+    uint32_t M_b[4], P_b[4], negdc_a[4], o_b[4], INV_c[4];
+    float dc_c[8], o_c[8];
 
     auto transpose_u32x4 = [](uint32_t const* src, uint32_t* dst) {
         SM75_U32x1_MOVM_T::copy(src[0], dst[0]);
@@ -247,64 +306,62 @@ CUTLASS_DEVICE void neumann_inv_fused_1warp(
         SM75_U32x1_MOVM_T::copy(src[3], dst[3]);
     };
 
-    auto copy_u32x4 = [](uint32_t const* src, uint32_t* dst) {
-        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+    // 16x16 MMA (fp32 acc) = two m16n8k16 atoms along N
+    auto mma_16x16 = [](float* d, uint32_t const* a, uint32_t const* b, float const* c) {
+        SM80_16x8x16_F32BF16BF16F32_TN::fma(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3]);
+        SM80_16x8x16_F32BF16BF16F32_TN::fma(d[4], d[5], d[6], d[7], a[0], a[1], a[2], a[3], b[2], b[3], c[4], c[5], c[6], c[7]);
     };
 
-    // 16x16 MMA = two m16n8k16 atoms along N
-    auto mma_16x16 = [](uint32_t* d, uint32_t const* a, uint32_t const* b, uint32_t const* c) {
-        SM80_16x8x16_F16F16F16F16_TN::fma(d[0], d[1], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1]);
-        SM80_16x8x16_F16F16F16F16_TN::fma(d[2], d[3], a[0], a[1], a[2], a[3], b[2], b[3], c[2], c[3]);
+    auto clear_f32x8 = [](float* x) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) x[j] = 0.0f;
     };
 
-    // L^2 = L × L
-    transpose_u32x4(L_a, Lpow_b);
-    clear_u32x4(Lpow_c);
-    mma_16x16(Lpow_c, L_a, Lpow_b, Lpow_c);
+    // Pack two fp32 -> one bf16x2 u32 (RNE; first element in the low half,
+    // matching the A-fragment pair order of the C accumulator).
+    auto pack_bf16x2 = [](float lo, float hi) -> uint32_t {
+        union U32B2 { uint32_t u; __nv_bfloat162 b2; } t;
+        t.b2 = __floats2bfloat162_rn(lo, hi);
+        return t.u;
+    };
 
-    // INV += INV × L^2
-    transpose_u32x4(Lpow_c, Lpow_b);
-    copy_u32x4(INV_a, INV_c);
-    clear_u32x4(mm_c);
-    mma_16x16(mm_c, INV_a, Lpow_b, mm_c);
-    add_fp16x2_u32x4(INV_c, mm_c);
+    // dc = P @ M (rows 8-15 hold B^-1 C; rows 0-7 are zero)
+    transpose_u32x4(M_a, M_b);
+    clear_f32x8(dc_c);
+    mma_16x16(dc_c, P_a, M_b, dc_c);
 
-    // L^4 = L^2 × L^2
-    copy_u32x4(Lpow_c, tmp_a);
-    clear_u32x4(Lpow_c);
-    mma_16x16(Lpow_c, tmp_a, Lpow_b, Lpow_c);
+    // o = bf16(-dc) @ P (fp32 negate with fast-math ftz, then quantize)
+    transpose_u32x4(P_a, P_b);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        negdc_a[j] = pack_bf16x2(dc_c[2 * j] * -1.0f, dc_c[2 * j + 1] * -1.0f);
+    clear_f32x8(o_c);
+    mma_16x16(o_c, negdc_a, P_b, o_c);
 
-    // INV += INV × L^4
-    transpose_u32x4(Lpow_c, Lpow_b);
-    copy_u32x4(INV_c, tmp_a);
-    clear_u32x4(mm_c);
-    mma_16x16(mm_c, tmp_a, Lpow_b, mm_c);
-    add_fp16x2_u32x4(INV_c, mm_c);
+    // INV = P + bf16(o) (nonzero blocks disjoint, so the add is exact)
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        o_b[j] = pack_bf16x2(o_c[2 * j], o_c[2 * j + 1]);
+    {
+        union U32B2 { uint32_t u; __nv_bfloat162 b2; };
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            U32B2 p{P_a[j]}, o{o_b[j]}, r;
+            r.b2 = __hadd2(p.b2, o.b2);
+            INV_c[j] = r.u;
+        }
+    }
 
-    // L^8 = L^4 × L^4
-    copy_u32x4(Lpow_c, tmp_a);
-    clear_u32x4(Lpow_c);
-    mma_16x16(Lpow_c, tmp_a, Lpow_b, Lpow_c);
-
-    // INV += INV × L^8
-    transpose_u32x4(Lpow_c, Lpow_b);
-    copy_u32x4(INV_c, tmp_a);
-    clear_u32x4(mm_c);
-    mma_16x16(mm_c, tmp_a, Lpow_b, mm_c);
-    add_fp16x2_u32x4(INV_c, mm_c);
-
-    // Store: convert C-format fp16 → bf16, write to smem
-    Tensor tCsC_mma = thr_mma.partition_C(INV_fp16);
+    // Store: STSM bf16 result to smem
+    Tensor tCsC_mma = thr_mma.partition_C(INV_bf16);
     Tensor tCrC = thr_mma.make_fragment_C(tCsC_mma);
-    uint32_t* C_regs = reinterpret_cast<uint32_t*>(&tCrC(0));
-    C_regs[0] = INV_c[0]; C_regs[1] = INV_c[1]; C_regs[2] = INV_c[2]; C_regs[3] = INV_c[3];
-
     Tensor tCrC_bf16 = make_fragment_like<BF16>(tCrC);
-    cute::transform(tCrC, tCrC_bf16, [] __device__ (FP16 x) -> BF16 { return BF16(x); });
+    uint32_t* out_regs = reinterpret_cast<uint32_t*>(&tCrC_bf16(0));
+    out_regs[0] = INV_c[0]; out_regs[1] = INV_c[1]; out_regs[2] = INV_c[2]; out_regs[3] = INV_c[3];
 
     auto smem_tiled_store = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, BF16>{}, mma);
     auto smem_thr_store = smem_tiled_store.get_slice(tid);
-    Tensor tCsC_st = smem_thr_store.partition_D(INV_bf16_out);
+    Tensor tCsC_st = smem_thr_store.partition_D(INV_bf16);
     Tensor tCrC_st_view = smem_thr_store.retile_S(tCrC_bf16);
     copy(smem_tiled_store, tCrC_st_view, tCsC_st);
 }
