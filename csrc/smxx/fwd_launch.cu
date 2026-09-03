@@ -19,6 +19,9 @@ void launch_fwd(
     cutlass::bfloat16_t const* v_ptr,
     cutlass::bfloat16_t const* g_bf16_ptr,
     cutlass::bfloat16_t const* beta_ptr,
+    int64_t beta_batch_stride,
+    int64_t beta_token_stride,
+    int64_t beta_head_stride,
     void const* initial_state_ptr,
     float scale,
     void* final_state_ptr,
@@ -56,11 +59,12 @@ void launch_fwd(
                                  typename K2L::GTotalLayout>);
     static_assert(std::is_same_v<typename K1L::LMLayout,
                                  typename K2L::LMLayout>);
+    static_assert(std::is_same_v<typename K1L::BetaSmemLayout,
+                                 typename K2L::BetaSmemLayout>);
 
     // TMA layouts for Kernel 1
     using TMAQKLayout = typename K1L::TMAQKLayout;
     using TMAGLayout = typename K1L::TMAGLayout;
-    using TMABetaSmemLayout = typename K1L::TMABetaSmemLayout;
     using TMAGTotalSmemLayout = typename K1L::TMAGTotalSmemLayout;
 
     // TMA layouts for Kernel 2
@@ -75,16 +79,12 @@ void launch_fwd(
 
     // --- gmem layouts for original tensors
     auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
-    // 1D beta layout: [H*T] contiguous
-    auto beta_gmem_layout = make_layout(make_shape(H * T_total));
     auto state_gmem_layout = make_layout(make_shape(N * H, D, D), LayoutRight{});
 
     Tensor m_q   = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
     Tensor m_k   = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
     Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
     Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), gmem_layout);
-    Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
-
     // --- Workspace gmem layouts (separated arrays)
     int64_t n_ht = int64_t(H) * total_tiles;
     char* ws = reinterpret_cast<char*>(workspace_ptr);
@@ -94,11 +94,11 @@ void launch_fwd(
     float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
+    BF16*  ws_beta = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV + WS::kMqk));
 
     // --- TMA descriptors for Kernel 1 inputs
     auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
     auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
-    auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
 
     Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
     auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
@@ -110,7 +110,6 @@ void launch_fwd(
     // --- TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
     // use the raw bulk-copy pointers above rather than tensor maps.
     auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
-    auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
     auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
 
     // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
@@ -155,7 +154,6 @@ void launch_fwd(
 
         auto kernel1 = _flash_kda_fwd_prepare<
             decltype(tma_load_q), decltype(tma_load_k),
-            decltype(tma_load_beta),
             decltype(tma_load_g), decltype(tma_load_dt_bias),
             CHUNK, D, kK1Threads, IsVarlen, SeqlenT
         >;
@@ -166,11 +164,11 @@ void launch_fwd(
         dim3 block_k1(kK1Threads);
 
         kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
-            tma_load_q, tma_load_k, tma_load_beta,
-            tma_load_g, tma_load_dt_bias,
+            tma_load_q, tma_load_k, tma_load_g, tma_load_dt_bias,
+            beta_ptr, beta_batch_stride, beta_token_stride, beta_head_stride,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
             A_log_ptr, gate_scale,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
         );
     }
 #endif
@@ -200,7 +198,6 @@ void launch_fwd(
 
             auto kernel2 = _flash_kda_fwd_recurrence<
                 decltype(tma_load_v_vsplit),
-                decltype(tma_load_beta2),
                 decltype(tma_load_initial_state_vsplit),
                 decltype(tma_store_final_state_vsplit),
                 decltype(tma_store_out_vsplit),
@@ -213,13 +210,12 @@ void launch_fwd(
                 kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 smem_size_k2);
             kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-                tma_load_v_vsplit, tma_load_beta2,
-                tma_load_initial_state_vsplit,
+                tma_load_v_vsplit, tma_load_initial_state_vsplit,
                 tma_store_final_state_vsplit,
                 tma_store_out_vsplit,
                 out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
                 T_total, H, N, cu_seqlens_ptr, total_tiles,
-                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta);
             return;
         }
 
@@ -227,8 +223,7 @@ void launch_fwd(
         int smem_size_k2 = sizeof(SharedStorageK2T);
 
         auto kernel2 = _flash_kda_fwd_recurrence<
-            decltype(tma_load_v), decltype(tma_load_beta2),
-            decltype(tma_load_initial_state),
+            decltype(tma_load_v), decltype(tma_load_initial_state),
             decltype(tma_store_final_state),
             decltype(tma_store_out),
             CHUNK, D, kInputStages, kOutputStages, kK2Threads,
@@ -243,13 +238,12 @@ void launch_fwd(
         dim3 grid_k2(H, N);
 
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-            tma_load_v, tma_load_beta2,
-            tma_load_initial_state,
+            tma_load_v, tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
             T_total, H, N, cu_seqlens_ptr, total_tiles,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
         );
     }
 #endif
@@ -260,7 +254,8 @@ void launch_fwd(
     template void launch_fwd<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
-        cutlass::bfloat16_t const*, void const*, float, void*, \
+        cutlass::bfloat16_t const*, int64_t, int64_t, int64_t, \
+        void const*, float, void*, \
         float*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
         int, int, int, int, \
         SEQLEN_T const*, float const*, float const*, float, bool, \
