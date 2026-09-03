@@ -60,12 +60,13 @@ __device__ __forceinline__ float bf16_to_f32(cutlass::bfloat16_t x) {
 
 using namespace cute;
 
-// Workspace per-tile byte sizes (all naturally 128-byte aligned)
+// Workspace per-tile byte sizes. Bulk-copy payloads are at least 16-byte aligned.
 template <int CHUNK, int D>
 struct WorkspaceSizes {
     static_assert(CHUNK * D * 2 % 128 == 0);
     static_assert(D * 4 % 128 == 0);
     static_assert(CHUNK * CHUNK * 2 % 128 == 0);
+    static_assert(CHUNK * 2 % 16 == 0);
 
     static constexpr int kKDecayed  = CHUNK * D * 2;        // 4096
     static constexpr int kQDecayed  = CHUNK * D * 2;        // 4096
@@ -73,7 +74,9 @@ struct WorkspaceSizes {
     static constexpr int kGTotal    = D * 4;                 // 512
     static constexpr int kINV       = CHUNK * CHUNK * 2;     // 512
     static constexpr int kMqk       = CHUNK * CHUNK * 2;     // 512
-    static constexpr int64_t kPerTile = kKDecayed + kQDecayed + kKRestored + kGTotal + kINV + kMqk;
+    static constexpr int kBeta      = CHUNK * 2;              // 32
+    static constexpr int64_t kPerTile =
+        kKDecayed + kQDecayed + kKRestored + kGTotal + kINV + kMqk + kBeta;
 };
 
 enum class WarpRole {
