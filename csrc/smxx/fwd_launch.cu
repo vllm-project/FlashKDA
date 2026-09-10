@@ -22,7 +22,7 @@ void launch_fwd(
     void const* initial_state_ptr,
     float scale,
     void* final_state_ptr,
-    float* checkpoint_state_ptr,
+    void* checkpoint_state_ptr,
     SeqlenT const* checkpoint_offsets_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
@@ -261,7 +261,7 @@ void launch_fwd(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
-        float*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
+        void*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
         int, int, int, int, \
         SEQLEN_T const*, float const*, float const*, float, bool, \
         cudaStream_t);
@@ -274,6 +274,7 @@ void launch_fwd(
     INSTANTIATE_CHECKPOINT_VARIANTS(true,  true,  false, VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(true,  true,  true,  VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(false, false, false, VL, SEQLEN_T) \
+    INSTANTIATE_CHECKPOINT_VARIANTS(false, false, true,  VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(false, true,  false, VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(true,  false, false, VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(false, true,  true,  VL, SEQLEN_T) \

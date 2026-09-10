@@ -1,5 +1,7 @@
 #pragma once
 
+#include <type_traits>
+
 #include "utils.cuh"
 
 template <int D, int CHUNK = 16, int VD = D>
@@ -147,7 +149,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
-    float* checkpoint_state_ptr,
+    void* checkpoint_state_raw,
     SeqlenT const* checkpoint_offsets,
     int T_total,
     int H,
@@ -162,6 +164,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     cutlass::bfloat16_t const* ws_mqk
 ) {
     using BF16 = cutlass::bfloat16_t;
+    using StateT = std::conditional_t<StateFP32, float, BF16>;
+    auto* checkpoint_state_ptr = static_cast<StateT*>(checkpoint_state_raw);
     static_assert(D % VD == 0, "VD must divide D");
     static_assert(VD == 64 || VD == D,
                   "K2 currently supports the original V tile or VD=64");
@@ -776,7 +780,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                         const int row = state_idx / D;
                         const int col = state_idx % D;
                         checkpoint_state_ptr[checkpoint_base + state_idx] =
-                            float(s_acc(row, col));
+                            StateT(s_acc(row, col));
                     }
                     checkpoint_barrier.arrive_and_wait();
                 }

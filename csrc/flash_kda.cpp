@@ -87,8 +87,15 @@ void fwd(
             cs.is_cuda() && cs.is_contiguous(),
             "checkpoint_state must be a contiguous CUDA tensor");
         STD_TORCH_CHECK(
-            cs.scalar_type() == ScalarType::Float,
-            "checkpoint_state must be float32");
+            cs.scalar_type() == ScalarType::Float ||
+                cs.scalar_type() == ScalarType::BFloat16,
+            "checkpoint_state must be bfloat16 or float32");
+        STD_TORCH_CHECK(
+            (!has_state_in || cs.scalar_type() == initial_state->scalar_type()) &&
+                (!has_state_out || cs.scalar_type() == final_state->scalar_type()),
+            "checkpoint_state must have the same dtype as initial_state and final_state");
+        // Checkpoints also select the state dtype when both other states are absent.
+        state_fp32 = cs.scalar_type() == ScalarType::Float;
         STD_TORCH_CHECK(
             co.is_cuda() && co.is_contiguous(),
             "checkpoint_offsets must be a contiguous CUDA tensor");
@@ -161,8 +168,8 @@ void fwd(
     // Get state pointers (nullptr if not present)
     void const* initial_state_raw = has_state_in ? initial_state->const_data_ptr() : nullptr;
     void* final_state_raw = has_state_out ? final_state->mutable_data_ptr() : nullptr;
-    float* checkpoint_state_raw = has_checkpoint
-        ? static_cast<float*>(checkpoint_state->mutable_data_ptr())
+    void* checkpoint_state_raw = has_checkpoint
+        ? checkpoint_state->mutable_data_ptr()
         : nullptr;
 
     // Determine cu_seqlens and N
@@ -251,7 +258,9 @@ void fwd(
                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
 
         #define DISPATCH_STATE(CKPT, VL) \
-            if (!has_state_in && !has_state_out) { \
+            if (!has_state_in && !has_state_out && state_fp32) { \
+                LAUNCH(false, false, true, CKPT, VL); \
+            } else if (!has_state_in && !has_state_out) { \
                 LAUNCH(false, false, false, CKPT, VL); \
             } else if (has_state_in && has_state_out && state_fp32) { \
                 LAUNCH(true, true, true, CKPT, VL); \
