@@ -21,7 +21,6 @@ struct K2Layouts {
         make_shape(Int<CHUNK>{}, Int<VD>{}),
         LayoutLeft{}
     ));
-    using BetaSmemLayout = Layout<Shape<Int<32>>, Stride<Int<1>>>;
     using StateSmemLayout = decltype(tile_to_shape(
         GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
         make_shape(Int<VD>{}, Int<D>{}),
@@ -39,7 +38,6 @@ struct K2Layouts {
         LayoutLeft{}
     ));
 
-    using TMABetaSmemLayout = BetaSmemLayout;  // 1D TMA, no dummy dim
     using TMAVOLayout = decltype(composition(
         VOLayout{}.layout_a(),
         VOLayout{}.offset(),
@@ -68,7 +66,6 @@ template <class Layouts, int InputStages, int OutputStages>
 struct SharedStorageK2 {
     using BF16 = cutlass::bfloat16_t;
     using VOLayout = typename Layouts::VOLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using StateSmemLayout = typename Layouts::StateSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
@@ -78,7 +75,6 @@ struct SharedStorageK2 {
 
     struct InputStorage {
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<VOLayout>> v;
-        alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<BetaSmemLayout>> beta;
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> k_decayed;
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> q_decayed;
         alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> k_restored;
@@ -125,7 +121,6 @@ CUTLASS_DEVICE void movm_transpose_c_to_b_16x16(
 // ==================== Kernel 2: Recurrence ====================
 template <
     class TmaLoadV,
-    class TmaLoadBeta,
     class TmaLoadState,
     class TmaStoreState,
     class TmaStoreOut,
@@ -144,7 +139,10 @@ template <
 >
 __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
-    CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
+    cutlass::bfloat16_t const* beta_ptr,
+    int64_t beta_batch_stride,
+    int64_t beta_token_stride,
+    int64_t beta_head_stride,
     CUTE_GRID_CONSTANT TmaLoadState const tma_load_initial_state,
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
@@ -173,13 +171,11 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     using MMALayout = typename Layouts::MMALayout;
     using TransposedMMALayout = typename Layouts::TransposedMMALayout;
     using VOLayout = typename Layouts::VOLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using StateSmemLayout = typename Layouts::StateSmemLayout;
     using TransposedStateSmemLayout = typename Layouts::TransposedStateSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using TMAVOLayout = typename Layouts::TMAVOLayout;
-    using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
     using TMAStateSmemLayout = typename Layouts::TMAStateSmemLayout;
     using SharedStorageT = SharedStorageK2<Layouts, InputStages, OutputStages>;
 
@@ -192,10 +188,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     constexpr int kComputeThreads = 128;
     constexpr int kVSlices = D / VD;
 
-    // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
+    // Transaction bytes: v + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
     constexpr uint32_t kTmaTransactionBytes =
         uint32_t(cute::cosize_v<VOLayout>) * uint32_t(sizeof(BF16)) +
-        uint32_t(32) * uint32_t(sizeof(BF16)) +  // beta (bf16, sigmoid fused)
         uint32_t(cute::cosize_v<MMALayout>) * uint32_t(sizeof(BF16)) * 3 +
         uint32_t(cute::cosize_v<GTotalLayout>) * uint32_t(sizeof(float)) +
         uint32_t(cute::cosize_v<LMLayout>) * uint32_t(sizeof(BF16)) * 2;
@@ -262,6 +257,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         eos = bos + T_seq;
         tile_base = seq_idx * ((T_seq + CHUNK - 1) / CHUNK);
     }
+    beta_ptr += (IsVarlen ? bos * beta_token_stride : int64_t(seq_idx) * beta_batch_stride)
+        + int64_t(head_idx) * beta_head_stride;
     int seq_len  = int(eos - bos);
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
 
@@ -342,14 +339,12 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         __syncthreads();
     }
 
-    // --- LOAD warp: issue TMA loads for v, beta, and workspace intermediates
+    // --- LOAD warp: issue TMA loads for v and workspace intermediates
     if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
         Tensor g_v = tma_load_v.get_tma_tensor(make_shape(H, T_total, D));
-        Tensor g_beta = tma_load_beta.get_tma_tensor(make_shape(H * T_total));
 
         LoadPipelineState load_write = cutlass::make_producer_start_state<LoadPipeline>();
         auto cta_tma_load_v = tma_load_v.get_slice(Int<0>{});
-        auto cta_tma_load_beta = tma_load_beta.get_slice(Int<0>{});
         for (int t = 0; t < t_tiles; ++t) {
             load_pipeline.producer_acquire(load_write);
             using LoadBarrierType = typename LoadPipeline::ProducerBarrierType;
@@ -364,15 +359,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             Tensor s_v_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].v.begin()), TMAVOLayout{});
             cute::copy(tma_load_v.with(*tma_barrier),
                 cta_tma_load_v.partition_S(g_v_tile), cta_tma_load_v.partition_D(s_v_tile));
-
-            // TMA load beta (1D)
-            int beta_linear = head_idx * T_total + (int(bos) + t * CHUNK);
-            int beta_aligned = beta_linear & ~7;
-            auto beta_off = g_beta.layout()(beta_aligned);
-            Tensor g_beta_tile = make_tensor(g_beta.data() + beta_off, BetaSmemLayout{});
-            Tensor s_beta_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].beta.begin()), TMABetaSmemLayout{});
-            cute::copy(tma_load_beta.with(*tma_barrier),
-                cta_tma_load_beta.partition_S(g_beta_tile), cta_tma_load_beta.partition_D(s_beta_tile));
 
             // K1 stores byte images of its swizzled shared-memory tensors.
             // K2 uses the same layouts, so raw bulk copies restore them
@@ -477,8 +463,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             int out_stage = out_write.index();
 
             Tensor v_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].v.begin()), VOLayout{});
-            Tensor beta_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].beta.begin()), BetaSmemLayout{});
-            int beta_smem_offset = (head_idx * T_total + int(bos) + t * CHUNK) & 7;
             Tensor out_tile = make_tensor(make_smem_ptr(shared_storage.output[out_stage].out.begin()), VOLayout{});
 
             Tensor k_decayed = make_tensor(make_smem_ptr(shared_storage.input[load_stage].k_decayed.begin()), MMALayout{});
@@ -609,8 +593,13 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
 
-            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
-            BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
+            int beta_token = t * CHUNK + group_id;
+            BF16 beta0 = beta_token < seq_len
+                ? BF16(sigmoid_tanh_approx_f32(float(beta_ptr[beta_token * beta_token_stride])))
+                : BF16(0.0f);
+            BF16 beta1 = beta_token + 8 < seq_len
+                ? BF16(sigmoid_tanh_approx_f32(float(beta_ptr[(beta_token + 8) * beta_token_stride])))
+                : BF16(0.0f);
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
             SFragT u_bf16[kValueBlocksPerWarp];
