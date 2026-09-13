@@ -59,8 +59,6 @@ void launch_fwd(
                                  typename K2L::GTotalLayout>);
     static_assert(std::is_same_v<typename K1L::LMLayout,
                                  typename K2L::LMLayout>);
-    static_assert(std::is_same_v<typename K1L::BetaSmemLayout,
-                                 typename K2L::BetaSmemLayout>);
 
     // TMA layouts for Kernel 1
     using TMAQKLayout = typename K1L::TMAQKLayout;
@@ -85,6 +83,7 @@ void launch_fwd(
     Tensor m_k   = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
     Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
     Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), gmem_layout);
+
     // --- Workspace gmem layouts (separated arrays)
     int64_t n_ht = int64_t(H) * total_tiles;
     char* ws = reinterpret_cast<char*>(workspace_ptr);
@@ -94,7 +93,6 @@ void launch_fwd(
     float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
-    BF16*  ws_beta = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV + WS::kMqk));
 
     // --- TMA descriptors for Kernel 1 inputs
     auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
@@ -168,7 +166,7 @@ void launch_fwd(
             beta_ptr, beta_batch_stride, beta_token_stride, beta_head_stride,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
             A_log_ptr, gate_scale,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );
     }
 #endif
@@ -210,12 +208,14 @@ void launch_fwd(
                 kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 smem_size_k2);
             kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-                tma_load_v_vsplit, tma_load_initial_state_vsplit,
+                tma_load_v_vsplit,
+                beta_ptr, beta_batch_stride, beta_token_stride, beta_head_stride,
+                tma_load_initial_state_vsplit,
                 tma_store_final_state_vsplit,
                 tma_store_out_vsplit,
                 out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
                 T_total, H, N, cu_seqlens_ptr, total_tiles,
-                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta);
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
             return;
         }
 
@@ -238,12 +238,14 @@ void launch_fwd(
         dim3 grid_k2(H, N);
 
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-            tma_load_v, tma_load_initial_state,
+            tma_load_v,
+            beta_ptr, beta_batch_stride, beta_token_stride, beta_head_stride,
+            tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
             T_total, H, N, cu_seqlens_ptr, total_tiles,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );
     }
 #endif

@@ -11,7 +11,6 @@ struct K1Layouts {
         make_shape(Int<CHUNK>{}, Int<D>{}),
         LayoutLeft{}
     ));
-    using BetaSmemLayout = Layout<Shape<Int<CHUNK>>, Stride<Int<1>>>;
     using GTotalLayout = Layout<Shape<Int<D>>, Stride<Int<1>>>;
     using LMLayout = decltype(tile_to_shape(
         GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
@@ -35,7 +34,6 @@ struct SharedStorageK1 {
     using BF16 = cutlass::bfloat16_t;
     using QKLayout = typename Layouts::QKLayout;
     using GLayout = typename Layouts::GLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using MMALayout = typename Layouts::MMALayout;
@@ -59,7 +57,6 @@ struct SharedStorageK1 {
         };
     };
 
-    alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<BetaSmemLayout>> beta;
     alignas(16) cute::ArrayEngine<float, 16> beta_act;
     alignas(16) cute::ArrayEngine<float, 16> q_norm_inv;
     alignas(16) cute::ArrayEngine<float, 16> k_norm_inv;
@@ -110,8 +107,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     cutlass::bfloat16_t* ws_kr,
     float* ws_gt,
     cutlass::bfloat16_t* ws_inv,
-    cutlass::bfloat16_t* ws_mqk,
-    cutlass::bfloat16_t* ws_beta
+    cutlass::bfloat16_t* ws_mqk
 ) {
     // --- constants
     using BF16 = cutlass::bfloat16_t;
@@ -119,7 +115,6 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     using MMALayout = typename Layouts::MMALayout;
     using QKLayout = typename Layouts::QKLayout;
     using GLayout = typename Layouts::GLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using LF32Layout = typename Layouts::LF32Layout;
@@ -222,21 +217,12 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     }
     int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
     int compute_tid = threadIdx.x;
+    beta_ptr += (IsVarlen ? bos * beta_token_stride : int64_t(seq_idx) * beta_batch_stride)
+        + int64_t(head_idx) * beta_head_stride;
     if (compute_tid < CHUNK) {
-        float beta_activated = 0.0f;
-        if (compute_tid < actual_len) {
-            int64_t beta_batch_idx = IsVarlen ? 0 : seq_idx;
-            int64_t beta_token_idx = IsVarlen
-                ? bos + local_t * CHUNK + compute_tid
-                : local_t * CHUNK + compute_tid;
-            int64_t beta_offset =
-                beta_batch_idx * beta_batch_stride +
-                beta_token_idx * beta_token_stride +
-                int64_t(head_idx) * beta_head_stride;
-            beta_activated = sigmoid_tanh_approx_f32(float(beta_ptr[beta_offset]));
-        }
-        shared_storage.beta_act.begin()[compute_tid] = beta_activated;
-        shared_storage.beta.begin()[compute_tid] = BF16(beta_activated);
+        shared_storage.beta_act.begin()[compute_tid] = compute_tid < actual_len
+            ? sigmoid_tanh_approx_f32(float(beta_ptr[(local_t * CHUNK + compute_tid) * beta_token_stride]))
+            : 0.0f;
     }
     // --- Wait for TMA (q, k, g_bf16, dt_bias) and scalar beta loads
     __syncthreads();
@@ -532,9 +518,5 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
             shared_storage.Mqk.begin(), mqk_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
         tma_store_arrive();
 
-        BF16* beta_dst = ws_beta + int64_t(ws_idx) * CHUNK;
-        cute::SM90_BULK_COPY_S2G::copy(
-            shared_storage.beta.begin(), beta_dst, int32_t(CHUNK * sizeof(BF16)));
-        tma_store_arrive();
     }
 }

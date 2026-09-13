@@ -22,10 +22,8 @@ int64_t get_workspace_size(
     static_assert(CHUNK * D * 2 % 128 == 0, "k_decayed/q_decayed/k_restored size must be 128-byte aligned");
     static_assert(D * 4 % 128 == 0, "g_total size must be 128-byte aligned");
     static_assert(CHUNK * CHUNK * 2 % 128 == 0, "INV/Mqk size must be 128-byte aligned");
-    static_assert(CHUNK * 2 % 16 == 0, "beta size must be 16-byte aligned");
 
-    int64_t per_tile_bytes =
-        3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2 + CHUNK * 2;
+    int64_t per_tile_bytes = 3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
 
     return H * total_tiles * per_tile_bytes;
 }
