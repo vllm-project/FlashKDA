@@ -11,7 +11,6 @@ struct K1Layouts {
         make_shape(Int<CHUNK>{}, Int<D>{}),
         LayoutLeft{}
     ));
-    using BetaSmemLayout = Layout<Shape<Int<32>>, Stride<Int<1>>>;
     using GTotalLayout = Layout<Shape<Int<D>>, Stride<Int<1>>>;
     using LMLayout = decltype(tile_to_shape(
         GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
@@ -25,7 +24,6 @@ struct K1Layouts {
         LayoutRight{}
     ));
 
-    using TMABetaSmemLayout = BetaSmemLayout;  // 1D TMA, no dummy dim
     using TMAQKLayout = decltype(prepend(QKLayout{}));
     using TMAGLayout = decltype(prepend(GLayout{}));
     using TMAGTotalSmemLayout = decltype(prepend(GTotalLayout{}));
@@ -36,7 +34,6 @@ struct SharedStorageK1 {
     using BF16 = cutlass::bfloat16_t;
     using QKLayout = typename Layouts::QKLayout;
     using GLayout = typename Layouts::GLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using MMALayout = typename Layouts::MMALayout;
@@ -60,7 +57,6 @@ struct SharedStorageK1 {
         };
     };
 
-    alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<BetaSmemLayout>> beta;
     alignas(16) cute::ArrayEngine<float, 16> beta_act;
     alignas(16) cute::ArrayEngine<float, 16> q_norm_inv;
     alignas(16) cute::ArrayEngine<float, 16> k_norm_inv;
@@ -81,7 +77,6 @@ struct SharedStorageK1 {
 template <
     class TmaLoadQ,
     class TmaLoadK,
-    class TmaLoadBeta,
     class TmaLoadG,
     class TmaLoadDtBias,
     int CHUNK,
@@ -93,9 +88,12 @@ template <
 __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
     CUTE_GRID_CONSTANT TmaLoadK const tma_load_k,
-    CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
     CUTE_GRID_CONSTANT TmaLoadG const tma_load_g,
     CUTE_GRID_CONSTANT TmaLoadDtBias const tma_load_dt_bias,
+    cutlass::bfloat16_t const* beta_ptr,
+    int64_t beta_batch_stride,
+    int64_t beta_token_stride,
+    int64_t beta_head_stride,
     float scale,
     int T_total,
     int H,
@@ -117,18 +115,15 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     using MMALayout = typename Layouts::MMALayout;
     using QKLayout = typename Layouts::QKLayout;
     using GLayout = typename Layouts::GLayout;
-    using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using LF32Layout = typename Layouts::LF32Layout;
     using TransposedLMLayout = typename Layouts::TransposedLMLayout;
     using TMAQKLayout = typename Layouts::TMAQKLayout;
-    using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
     using TMAGTotalSmemLayout = typename Layouts::TMAGTotalSmemLayout;
     static_assert(NumThreads == 128);
     constexpr uint32_t kTmaTransactionBytes =
         uint32_t(cute::cosize_v<QKLayout>) * uint32_t(3 * sizeof(BF16)) +  // q + k + g_bf16
-        uint32_t(32) * uint32_t(sizeof(BF16)) +  // beta (bf16, sigmoid fused)
         uint32_t(D) * uint32_t(sizeof(float));  // dt_bias
 
     // --- shared memory
@@ -182,11 +177,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
 
         Tensor g_q = tma_load_q.get_tma_tensor(make_shape(H, T_total, D));
         Tensor g_k = tma_load_k.get_tma_tensor(make_shape(H, T_total, D));
-        Tensor g_beta = tma_load_beta.get_tma_tensor(make_shape(H * T_total));
-
         auto cta_tma_load_q = tma_load_q.get_slice(Int<0>{});
         auto cta_tma_load_k = tma_load_k.get_slice(Int<0>{});
-        auto cta_tma_load_beta = tma_load_beta.get_slice(Int<0>{});
 
         auto qk_off = g_q.layout()(head_idx, int(bos) + local_t * CHUNK, 0);
         auto tile_shape_3d = make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{});
@@ -194,22 +186,13 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         Tensor g_q_tile = make_tensor(g_q.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
         Tensor g_k_tile = make_tensor(g_k.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
 
-        int beta_linear = head_idx * T_total + (int(bos) + local_t * CHUNK);
-        int beta_aligned = beta_linear & ~7;
-        auto beta_off = g_beta.layout()(beta_aligned);
-        Tensor g_beta_tile = make_tensor(g_beta.data() + beta_off, BetaSmemLayout{});
-
         Tensor s_q_tile = make_tensor(make_smem_ptr(shared_storage.q.begin()), TMAQKLayout{});
         Tensor s_k_tile = make_tensor(make_smem_ptr(shared_storage.k.begin()), TMAQKLayout{});
-        Tensor s_beta_tile = make_tensor(make_smem_ptr(shared_storage.beta.begin()), TMABetaSmemLayout{});
 
         cute::copy(tma_load_q.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
             cta_tma_load_q.partition_S(g_q_tile), cta_tma_load_q.partition_D(s_q_tile));
         cute::copy(tma_load_k.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
             cta_tma_load_k.partition_S(g_k_tile), cta_tma_load_k.partition_D(s_k_tile));
-        cute::copy(tma_load_beta.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
-            cta_tma_load_beta.partition_S(g_beta_tile), cta_tma_load_beta.partition_D(s_beta_tile));
-
         // TMA load g_bf16 (same gmem layout as q/k)
         Tensor g_g = tma_load_g.get_tma_tensor(make_shape(H, T_total, D));
         auto cta_tma_load_g = tma_load_g.get_slice(Int<0>{});
@@ -232,19 +215,20 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     if (threadIdx.x == 0) {
         shared_storage.a_log_exp = expf(A_log_ptr[head_idx]);
     }
-    // --- Wait for TMA (q, k, beta, g_bf16, dt_bias)
+    int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
+    int compute_tid = threadIdx.x;
+    beta_ptr += (IsVarlen ? bos * beta_token_stride : int64_t(seq_idx) * beta_batch_stride)
+        + int64_t(head_idx) * beta_head_stride;
+    if (compute_tid < CHUNK) {
+        shared_storage.beta_act.begin()[compute_tid] = compute_tid < actual_len
+            ? sigmoid_tanh_approx_f32(float(beta_ptr[(local_t * CHUNK + compute_tid) * beta_token_stride]))
+            : 0.0f;
+    }
+    // --- Wait for TMA (q, k, g_bf16, dt_bias) and scalar beta loads
     __syncthreads();
     shared_storage.tma_load_barrier.wait(0);
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
-
-    int compute_tid = threadIdx.x;
-    int beta_smem_offset = (head_idx * T_total + int(bos) + local_t * CHUNK) & 7;
-    if (compute_tid < CHUNK) {
-        shared_storage.beta_act.begin()[compute_tid] = sigmoid_tanh_approx_f32(
-            float(shared_storage.beta.begin()[beta_smem_offset + compute_tid]));
-    }
-    int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
 
     // --- QK L2 Normalization ---
     {
@@ -533,5 +517,6 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.Mqk.begin(), mqk_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
         tma_store_arrive();
+
     }
 }

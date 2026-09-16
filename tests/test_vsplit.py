@@ -276,3 +276,32 @@ def test_vsplit_varlen_exact(
     state_case: StateCase, cu_dtype: torch.dtype
 ) -> None:
     _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)
+
+
+@pytest.mark.parametrize("varlen", (False, True))
+@pytest.mark.parametrize("use_vsplit", (False, True))
+def test_row_strided_beta(varlen: bool, use_vsplit: bool) -> None:
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    sequences = 2 if use_vsplit else num_sms // (2 * H) + 1
+    cu_seqlens = (
+        torch.arange(sequences + 1, dtype=torch.int64, device="cuda") * 17
+        if varlen else None
+    )
+    problem = _make_problem(
+        batch=1 if varlen else sequences,
+        seq_len=17 * sequences if varlen else 17,
+        cu_seqlens=cu_seqlens,
+        num_sequences=sequences,
+        seed=505,
+    )
+    storage = torch.empty(
+        (*problem.beta.shape[:-1], H + 3), dtype=problem.beta.dtype, device="cuda"
+    )
+    beta = storage[..., :H]
+    beta.copy_(problem.beta)
+    state_case = StateCase("beta_strides", True, True, torch.bfloat16)
+    initial = _state_template(problem, state_case)
+    expected = _run_kernel(problem, state_case, initial)
+    actual = _run_kernel(dataclasses.replace(problem, beta=beta), state_case, initial)
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])

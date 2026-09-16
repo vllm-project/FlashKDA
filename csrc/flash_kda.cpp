@@ -145,17 +145,15 @@ void fwd(
     auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k.const_data_ptr());
     auto v_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(v.const_data_ptr());
     auto g_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(g.const_data_ptr());
+    auto beta_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta.const_data_ptr());
+    int64_t beta_batch_stride = beta.stride(0);
+    int64_t beta_token_stride = beta.stride(1);
+    int64_t beta_head_stride = beta.stride(2);
     float scale_f = scale;
     auto out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(out.mutable_data_ptr());
     auto A_log_ptr = reinterpret_cast<float const*>(A_log.const_data_ptr());
     auto dt_bias_ptr = reinterpret_cast<float const*>(dt_bias.const_data_ptr());
     float gate_scale = float(lower_bound * 1.4426950408889634);
-
-    // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
-    Tensor beta_bht = torch::stable::transpose(beta, 1, 2);
-    Tensor beta_hbt = torch::stable::transpose(beta_bht, 0, 1);
-    Tensor beta_t = torch::stable::contiguous(beta_hbt);
-    auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.const_data_ptr());
 
     auto workspace_ptr = workspace.mutable_data_ptr();
 
@@ -250,7 +248,8 @@ void fwd(
             : nullptr;
         #define LAUNCH(HI, HO, FP32, CKPT, VL) \
             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
-                q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, \
+                beta_batch_stride, beta_token_stride, beta_head_stride, \
                 initial_state_raw, scale_f, final_state_raw, \
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
