@@ -12,7 +12,7 @@ STABLE_TORCH_LIBRARY(flash_kda, m) {
         "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
         "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
         "Tensor(d!)? checkpoint_state=None, "
-        "Tensor? checkpoint_offsets=None) -> ()");
+        "Tensor? checkpoint_offsets=None, Tensor? segment_ids=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {

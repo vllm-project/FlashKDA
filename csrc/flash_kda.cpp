@@ -44,7 +44,8 @@ void fwd(
     std::optional<Tensor> final_state,
     std::optional<Tensor> cu_seqlens,
     std::optional<Tensor> checkpoint_state,
-    std::optional<Tensor> checkpoint_offsets
+    std::optional<Tensor> checkpoint_offsets,
+    std::optional<Tensor> segment_ids
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
@@ -196,6 +197,20 @@ void fwd(
         N_val = B;
     }
 
+    // The recurrence covers only the listed sequences; preparation covers all.
+    int32_t const* segment_ids_ptr = nullptr;
+    int num_segment_ids = -1;
+    if (segment_ids.has_value()) {
+        STD_TORCH_CHECK(is_varlen, "segment_ids requires cu_seqlens");
+        STD_TORCH_CHECK(
+            segment_ids->is_cuda() && segment_ids->is_contiguous() &&
+                segment_ids->dim() == 1 &&
+                segment_ids->scalar_type() == ScalarType::Int,
+            "segment_ids must be a contiguous 1-D int32 CUDA tensor");
+        segment_ids_ptr = static_cast<int32_t const*>(segment_ids->const_data_ptr());
+        num_segment_ids = int(segment_ids->numel());
+    }
+
     int num_sms = 0;
     cudaError_t attr_status = cudaDeviceGetAttribute(
         &num_sms,
@@ -254,7 +269,8 @@ void fwd(
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
-                A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
+                A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream, \
+                segment_ids_ptr, num_segment_ids)
 
         #define DISPATCH_STATE(CKPT, VL) \
             if (!has_state_in && !has_state_out && state_fp32) { \

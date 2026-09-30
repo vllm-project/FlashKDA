@@ -33,5 +33,12 @@ void launch_fwd(
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream
+    cudaStream_t stream,
+    // K2 covers only the first ``num_segment_ids`` sequences listed in
+    // ``segment_ids``; -1 covers every sequence.
+    int32_t const* segment_ids = nullptr,
+    int num_segment_ids = -1,
+    // K1 (prepare) fills ``workspace``; K2 (recurrence) reads it.
+    bool run_prepare = true,
+    bool run_recurrence = true
 );

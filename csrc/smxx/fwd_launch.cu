@@ -35,7 +35,11 @@ void launch_fwd(
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int32_t const* segment_ids,
+    int num_segment_ids,
+    bool run_prepare,
+    bool run_recurrence
 ) {
     using BF16 = cutlass::bfloat16_t;
     constexpr int kInputStages = 3;
@@ -95,24 +99,6 @@ void launch_fwd(
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
 
-    // --- TMA descriptors for Kernel 1 inputs
-    auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
-    auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
-    auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
-
-    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
-    auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
-
-    auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
-    Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
-    auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
-
-    // --- TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
-    // use the raw bulk-copy pointers above rather than tensor maps.
-    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
-    auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
-    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
-
     // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
     auto make_state_tma = [&](auto state_smem_layout,
                               auto fp32_state_smem_layout) {
@@ -144,11 +130,20 @@ void launch_fwd(
             return cute::make_tuple(tma_load, tma_store);
         }
     };
-    auto [tma_load_initial_state, tma_store_final_state] = make_state_tma(
-        TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
     // ===== Launch Kernel 1 (prepare) =====
 #if BLOCK_LEVEL_K1 >= 0
-    {
+    if (run_prepare) {
+        auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
+        auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
+        auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+
+        Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
+        auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
+
+        auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
+        Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
+        auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
+
         constexpr int kK1Threads = 128;
         using SharedStorageK1T = SharedStorageK1<K1L>;
         int smem_size_k1 = sizeof(SharedStorageK1T);
@@ -177,7 +172,19 @@ void launch_fwd(
 
     // ===== Launch Kernel 2 (recurrence) =====
 #if BLOCK_LEVEL_K2 >= 0
-    {
+    // A launch may cover a listed subset of the sequences.
+    const bool subset = num_segment_ids >= 0;
+    const int num_launch = subset ? num_segment_ids : N;
+    if (!subset) segment_ids = nullptr;
+    if (run_recurrence && num_launch > 0) {
+        // TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
+        // use the raw bulk-copy pointers above rather than tensor maps.
+        auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+        auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+        auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
+        auto [tma_load_initial_state, tma_store_final_state] = make_state_tma(
+            TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
+
         // Full width: one math warpgroup plus one load/store warpgroup, for
         // register reallocation. V-split: math warpgroup plus load/store warps.
         constexpr int kK2Threads = 128 + 128;
@@ -186,7 +193,7 @@ void launch_fwd(
 
         // V-split doubles the blocks per head. Use it while its grid fits in
         // one wave.
-        const int vsplit_blocks = H * (D / VD) * N;
+        const int vsplit_blocks = H * (D / VD) * num_launch;
         if (vsplit_blocks <= 2 * num_sms) {
             // Keep the default path's host launch overhead unchanged: split
             // TensorMaps are constructed only when this path may be used.
@@ -202,7 +209,7 @@ void launch_fwd(
             using SharedStorageK2T = SharedStorageK2<
                 K2VSplitL, kInputStages, kOutputStages>;
             int smem_size_k2 = sizeof(SharedStorageK2T);
-            dim3 grid_k2(H * (D / VD), N);
+            dim3 grid_k2(H * (D / VD), num_launch);
 
             auto kernel2 = _flash_kda_fwd_recurrence<
                 decltype(tma_load_v_vsplit),
@@ -235,7 +242,7 @@ void launch_fwd(
                     tma_store_out_vsplit,
                     out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
                     T_total, H, N, cu_seqlens_ptr, total_tiles,
-                    ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+                    ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, segment_ids);
                 return;
             }
         }
@@ -257,7 +264,7 @@ void launch_fwd(
 
         // K2 maps x to head so all heads of a sequence launch together.
         // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
-        dim3 grid_k2(H, N);
+        dim3 grid_k2(H, num_launch);
 
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
             tma_load_v, tma_load_beta2,
@@ -266,7 +273,7 @@ void launch_fwd(
             tma_store_out,
             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
             T_total, H, N, cu_seqlens_ptr, total_tiles,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, segment_ids
         );
     }
 #endif
@@ -281,7 +288,7 @@ void launch_fwd(
         void*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
         int, int, int, int, \
         SEQLEN_T const*, float const*, float const*, float, int, \
-        cudaStream_t);
+        cudaStream_t, int32_t const*, int, bool, bool);
 
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
     INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T) \

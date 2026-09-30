@@ -202,7 +202,8 @@ _flash_kda_fwd_recurrence(
     cutlass::bfloat16_t const* ws_kr,
     float const* ws_gt,
     cutlass::bfloat16_t const* ws_inv,
-    cutlass::bfloat16_t const* ws_mqk
+    cutlass::bfloat16_t const* ws_mqk,
+    int32_t const* segment_ids
 ) {
     using BF16 = cutlass::bfloat16_t;
     using StateT = std::conditional_t<StateFP32, float, BF16>;
@@ -299,8 +300,12 @@ _flash_kda_fwd_recurrence(
     int seq_idx = int(blockIdx.y);
     if constexpr (IsVarlen) {
         // vLLM orders decodes before prefills. Reverse that order so the
-        // long-running prefill CTAs are issued first.
-        seq_idx = N - 1 - seq_idx;
+        // long-running prefill CTAs are issued first. A launch may cover a
+        // listed subset of the sequences.
+        seq_idx = int(gridDim.y) - 1 - seq_idx;
+        if (segment_ids != nullptr) {
+            seq_idx = segment_ids[seq_idx];
+        }
     }
     int64_t bos, eos;
     int tile_base;

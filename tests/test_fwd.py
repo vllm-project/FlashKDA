@@ -312,6 +312,53 @@ def test_fwd_varlen():
     print("Success: varlen kernel == torch ref (exact match)")
 
 
+def test_fwd_varlen_segment_ids():
+    """A recurrence over listed sequences matches the full launch there and
+    leaves the other sequences' output and final state untouched."""
+    H, D = 8, 128
+    LOWER_BOUND = -5.0
+    seq_lens = [300, 16, 1, 513, 64]
+    T_total = sum(seq_lens)
+    N = len(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
+        dtype=torch.int32, device='cuda',
+    )
+    torch.manual_seed(0)
+    q = F.normalize(torch.randn((1, T_total, H, D), device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn((1, T_total, H, D), device='cuda'), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    g = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device='cuda')
+    beta = torch.randn((1, T_total, H), dtype=torch.bfloat16, device='cuda')
+    A_log = torch.rand(H, dtype=torch.float32, device='cuda')
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device='cuda')
+    initial_state = torch.randn((N, H, D, D), dtype=torch.float32, device='cuda')
+    scale = 1.0 / math.sqrt(D)
+
+    def run(segment_ids):
+        out = torch.full_like(q, 7.0)
+        final_state = torch.full_like(initial_state, 7.0)
+        flash_kda.fwd(q, k, v, g, beta, scale, out,
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      initial_state=initial_state, final_state=final_state,
+                      cu_seqlens=cu_seqlens, segment_ids=segment_ids)
+        return out, final_state
+
+    out_ref, final_ref = run(None)
+    listed = [3, 0, 2]
+    out, final_state = run(torch.tensor(listed, dtype=torch.int32, device='cuda'))
+    for n in range(N):
+        tokens = slice(int(cu_seqlens[n]), int(cu_seqlens[n + 1]))
+        if n in listed:
+            assert torch.equal(out[:, tokens], out_ref[:, tokens])
+            assert torch.equal(final_state[n], final_ref[n])
+        else:
+            assert (out[:, tokens] == 7.0).all()
+            assert (final_state[n] == 7.0).all()
+    out, final_state = run(torch.empty(0, dtype=torch.int32, device='cuda'))
+    assert (out == 7.0).all() and (final_state == 7.0).all()
+
+
 @torch.inference_mode()
 def test_fwd_vs_fla():
     from fla.utils import assert_close, device
