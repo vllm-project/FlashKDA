@@ -4,8 +4,12 @@
 #include "fwd_kernel1.cuh"
 #include "fwd_kernel2.cuh"
 
-// ==================== launch_fwd ====================
+// Shared body of launch_fwd, launch_prepare and launch_recurrence. RunPrepare
+// and RunRecurrence select the kernels; a kernel that does not run never
+// touches its inputs, so they may be null.
 template <
+    bool RunPrepare,
+    bool RunRecurrence,
     int D,
     bool HasStateIn,
     bool HasStateOut,
@@ -13,7 +17,7 @@ template <
     bool HasCheckpoint,
     bool IsVarlen,
     typename SeqlenT>
-void launch_fwd(
+static void launch_kernels(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
     cutlass::bfloat16_t const* v_ptr,
@@ -79,10 +83,6 @@ void launch_fwd(
     auto beta_gmem_layout = make_layout(make_shape(H * T_total));
     auto state_gmem_layout = make_layout(make_shape(N * H, D, D), LayoutRight{});
 
-    Tensor m_q   = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
-    Tensor m_k   = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
-    Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
-    Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), gmem_layout);
     Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
 
     // --- Workspace gmem layouts (separated arrays)
@@ -94,24 +94,6 @@ void launch_fwd(
     float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
-
-    // --- TMA descriptors for Kernel 1 inputs
-    auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
-    auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
-    auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
-
-    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
-    auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
-
-    auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
-    Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
-    auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
-
-    // --- TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
-    // use the raw bulk-copy pointers above rather than tensor maps.
-    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
-    auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
-    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
 
     // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
     auto make_state_tma = [&](auto state_smem_layout,
@@ -144,11 +126,22 @@ void launch_fwd(
             return cute::make_tuple(tma_load, tma_store);
         }
     };
-    auto [tma_load_initial_state, tma_store_final_state] = make_state_tma(
-        TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
     // ===== Launch Kernel 1 (prepare) =====
 #if BLOCK_LEVEL_K1 >= 0
-    {
+    if constexpr (RunPrepare) {
+        Tensor m_q = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
+        Tensor m_k = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
+        auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
+        auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
+        auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+
+        Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
+        auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
+
+        auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
+        Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
+        auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
+
         constexpr int kK1Threads = 128;
         using SharedStorageK1T = SharedStorageK1<K1L>;
         int smem_size_k1 = sizeof(SharedStorageK1T);
@@ -177,7 +170,17 @@ void launch_fwd(
 
     // ===== Launch Kernel 2 (recurrence) =====
 #if BLOCK_LEVEL_K2 >= 0
-    {
+    if constexpr (RunRecurrence) {
+        // TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
+        // use the raw bulk-copy pointers above rather than tensor maps.
+        Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
+        Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), gmem_layout);
+        auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+        auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+        auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
+        auto [tma_load_initial_state, tma_store_final_state] = make_state_tma(
+            TMAStateSmemLayout{}, TMAFP32StateSmemLayout{});
+
         // Full width: one math warpgroup plus one load/store warpgroup, for
         // register reallocation. V-split: math warpgroup plus load/store warps.
         constexpr int kK2Threads = 128 + 128;
@@ -272,6 +275,107 @@ void launch_fwd(
 #endif
 }
 
+// ==================== launch_fwd ====================
+template <
+    int D,
+    bool HasStateIn,
+    bool HasStateOut,
+    bool StateFP32,
+    bool HasCheckpoint,
+    bool IsVarlen,
+    typename SeqlenT>
+void launch_fwd(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void const* initial_state_ptr,
+    float scale,
+    void* final_state_ptr,
+    void* checkpoint_state_ptr,
+    SeqlenT const* checkpoint_offsets_ptr,
+    cutlass::bfloat16_t* out_ptr,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    SeqlenT const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    int num_sms,
+    cudaStream_t stream
+) {
+    launch_kernels<true, true, D, HasStateIn, HasStateOut, StateFP32,
+                   HasCheckpoint, IsVarlen, SeqlenT>(
+        q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale,
+        final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
+        workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr, A_log_ptr,
+        dt_bias_ptr, gate_scale, num_sms, stream);
+}
+
+// ==================== launch_prepare ====================
+template <int D, bool IsVarlen, typename SeqlenT>
+void launch_prepare(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    float scale,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    SeqlenT const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream
+) {
+    launch_kernels<true, false, D, false, false, false, false, IsVarlen,
+                   SeqlenT>(
+        q_ptr, k_ptr, nullptr, g_bf16_ptr, beta_ptr, nullptr, scale, nullptr,
+        nullptr, nullptr, nullptr, workspace_ptr, total_tiles, T_total, H, N,
+        cu_seqlens_ptr, A_log_ptr, dt_bias_ptr, gate_scale, 0, stream);
+}
+
+// ==================== launch_recurrence ====================
+template <
+    int D,
+    bool HasStateIn,
+    bool HasStateOut,
+    bool StateFP32,
+    bool HasCheckpoint,
+    bool IsVarlen,
+    typename SeqlenT>
+void launch_recurrence(
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void const* initial_state_ptr,
+    void* final_state_ptr,
+    void* checkpoint_state_ptr,
+    SeqlenT const* checkpoint_offsets_ptr,
+    cutlass::bfloat16_t* out_ptr,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    SeqlenT const* cu_seqlens_ptr,
+    int num_sms,
+    cudaStream_t stream
+) {
+    launch_kernels<false, true, D, HasStateIn, HasStateOut, StateFP32,
+                   HasCheckpoint, IsVarlen, SeqlenT>(
+        nullptr, nullptr, v_ptr, nullptr, beta_ptr, initial_state_ptr, 0.0f,
+        final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
+        workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr, nullptr,
+        nullptr, 0.0f, num_sms, stream);
+}
+
 // Explicit instantiations
 #define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, CKPT, VL, SEQLEN_T) \
     template void launch_fwd<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \
@@ -283,9 +387,25 @@ void launch_fwd(
         SEQLEN_T const*, float const*, float const*, float, int, \
         cudaStream_t);
 
+#define INSTANTIATE_LAUNCH_RECURRENCE(D, HI, HO, FP32, CKPT, VL, SEQLEN_T) \
+    template void launch_recurrence<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \
+        cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+        void const*, void*, void*, SEQLEN_T const*, \
+        cutlass::bfloat16_t*, void*, int, int, int, int, \
+        SEQLEN_T const*, int, cudaStream_t);
+
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
     INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T) \
-    INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, true,  VL, SEQLEN_T)
+    INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, true,  VL, SEQLEN_T) \
+    INSTANTIATE_LAUNCH_RECURRENCE(128, HI, HO, FP32, false, VL, SEQLEN_T) \
+    INSTANTIATE_LAUNCH_RECURRENCE(128, HI, HO, FP32, true,  VL, SEQLEN_T)
+
+#define INSTANTIATE_LAUNCH_PREPARE(VL, SEQLEN_T) \
+    template void launch_prepare<128, VL, SEQLEN_T>( \
+        cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+        cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, float, \
+        void*, int, int, int, int, SEQLEN_T const*, float const*, \
+        float const*, float, cudaStream_t);
 
 #define INSTANTIATE_STATE_VARIANTS(VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(true,  true,  false, VL, SEQLEN_T) \
@@ -297,7 +417,13 @@ void launch_fwd(
     INSTANTIATE_CHECKPOINT_VARIANTS(false, true,  true,  VL, SEQLEN_T) \
     INSTANTIATE_CHECKPOINT_VARIANTS(true,  false, true,  VL, SEQLEN_T)
 
+// launch_fwd and launch_recurrence
 INSTANTIATE_STATE_VARIANTS(true, int32_t)
 INSTANTIATE_STATE_VARIANTS(true, int64_t)
 INSTANTIATE_STATE_VARIANTS(false, int32_t)
 INSTANTIATE_STATE_VARIANTS(false, int64_t)
+// launch_prepare has no state or checkpoint parameters
+INSTANTIATE_LAUNCH_PREPARE(true, int32_t)
+INSTANTIATE_LAUNCH_PREPARE(true, int64_t)
+INSTANTIATE_LAUNCH_PREPARE(false, int32_t)
+INSTANTIATE_LAUNCH_PREPARE(false, int64_t)
