@@ -340,6 +340,8 @@ void launch_prepare(
     int T_total,
     int H,
     int N,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
@@ -350,7 +352,8 @@ void launch_prepare(
                    SeqlenT>(
         q_ptr, k_ptr, nullptr, g_bf16_ptr, beta_ptr, nullptr, scale, nullptr,
         nullptr, nullptr, nullptr, workspace_ptr, total_tiles, T_total, H, N,
-        0, 0, 0, cu_seqlens_ptr, A_log_ptr, dt_bias_ptr, gate_scale, 0, stream);
+        q_token_stride, k_token_stride, 0, cu_seqlens_ptr, A_log_ptr, dt_bias_ptr,
+        gate_scale, 0, stream);
 }
 
 // ==================== launch_recurrence ====================
@@ -375,6 +378,7 @@ void launch_recurrence(
     int T_total,
     int H,
     int N,
+    int64_t v_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     int num_sms,
     cudaStream_t stream
@@ -383,8 +387,8 @@ void launch_recurrence(
                    HasCheckpoint, IsVarlen, SeqlenT>(
         nullptr, nullptr, v_ptr, nullptr, beta_ptr, initial_state_ptr, 0.0f,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
-        workspace_ptr, total_tiles, T_total, H, N, 0, 0, 0, cu_seqlens_ptr, nullptr,
-        nullptr, 0.0f, num_sms, stream);
+        workspace_ptr, total_tiles, T_total, H, N, 0, 0, v_token_stride,
+        cu_seqlens_ptr, nullptr, nullptr, 0.0f, num_sms, stream);
 }
 
 // Explicit instantiations
@@ -403,7 +407,7 @@ void launch_recurrence(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         void const*, void*, void*, SEQLEN_T const*, \
         cutlass::bfloat16_t*, void*, int, int, int, int, \
-        SEQLEN_T const*, int, cudaStream_t);
+        int64_t, SEQLEN_T const*, int, cudaStream_t);
 
 #define INSTANTIATE_CHECKPOINT_VARIANTS(HI, HO, FP32, VL, SEQLEN_T) \
     INSTANTIATE_LAUNCH_FWD(128, HI, HO, FP32, false, VL, SEQLEN_T) \
@@ -415,7 +419,8 @@ void launch_recurrence(
     template void launch_prepare<128, VL, SEQLEN_T>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, float, \
-        void*, int, int, int, int, SEQLEN_T const*, float const*, \
+        void*, int, int, int, int, int64_t, int64_t, \
+        SEQLEN_T const*, float const*, \
         float const*, float, cudaStream_t);
 
 #define INSTANTIATE_STATE_VARIANTS(VL, SEQLEN_T) \

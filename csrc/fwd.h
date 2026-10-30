@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
 #include <cutlass/bfloat16.h>
@@ -59,6 +61,8 @@ void launch_prepare(
     int T_total,
     int H,
     int N,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
@@ -87,6 +91,7 @@ void launch_recurrence(
     int T_total,
     int H,
     int N,
+    int64_t v_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     int num_sms,
     cudaStream_t stream

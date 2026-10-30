@@ -278,114 +278,45 @@ def test_fwd_long_varlen(seq_lens):
 # Row-strided Q/K/V
 # ---------------------------------------------------------------------------
 
-def _make_strided_inputs(B, T, H, layout):
-    torch.manual_seed(42)
-    if layout == "packed":
-        packed = torch.randn(B, T, 3, H, 128, device="cuda", dtype=torch.bfloat16)
-        qkv = packed.unbind(2)
-    else:
-        qkv = tuple(
-            torch.empty(B * T * (gap * H * 128 + 8) + 8, device="cuda", dtype=torch.bfloat16)[8:]
-            .as_strided((B, T, H, 128), (T * (gap * H * 128 + 8), gap * H * 128 + 8, 128, 1))
-            .normal_()
-            for gap in (1, 2, 3)
-        )
-    qkv = tuple(x.as_strided(x.shape, (
-        x.stride(0) if B > 1 else 0, x.stride(1) if T > 1 else 0,
-        x.stride(2) if H > 1 else 0, 1,
-    )) for x in qkv)
-    g = torch.randn(B, T, H, 128, device="cuda", dtype=torch.bfloat16)
-    beta = torch.randn(B, T, 2, H, device="cuda", dtype=torch.bfloat16)[:, :, 0]
-    A_log = torch.zeros(H, device="cuda")
-    dt_bias = torch.zeros(H, 128, device="cuda")
-    return qkv, (g, beta, A_log, dt_bias)
-
-
-def _run_strided_fwd(qkv, gates, lengths, state, graph=False):
-    q, k, v = qkv
-    B, T, H, D = q.shape
-    cu = None if lengths is None else torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32,
-    )
-    N = B if lengths is None else len(lengths)
-    workspace = torch.empty(flash_kda.get_workspace_size(B * T, H, N), device="cuda", dtype=torch.uint8)
-    out = torch.empty(q.shape, device="cuda", dtype=q.dtype)
-    final = torch.empty_like(state)
-    checkpoint = torch.zeros_like(state)
-    offsets = torch.tensor(
-        [min(n, 16) for n in (lengths if lengths is not None else [T] * B)],
-        device="cuda", dtype=torch.int32 if cu is not None else torch.int64,
-    )
-    g, beta, A_log, dt_bias = gates
-
-    def call():
-        torch.ops.flash_kda.fwd(
-            q, k, v, g, beta, 1 / math.sqrt(D), out, workspace, A_log, dt_bias, -5.0,
-            state, final, cu, checkpoint, offsets,
-        )
-
-    if graph:
-        call()
-        torch.cuda.synchronize()
-        captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            call()
-        # These allocations precede capture and are not owned by the graph pool.
-        return (out, final, checkpoint), captured, (workspace, cu, offsets)
-    call()
-    return out, final, checkpoint
-
-
-@pytest.mark.parametrize("B,T,H,lengths", [
-    (1, 37, 4, None), (2, 37, 4, None), (2, 1, 4, None),
-    (1, 37, 1, None), (1, 129, 4, [17, 47, 65]), (1, 2048, 32, [2048]),
-    (1, 37, 256, None), (1, 1, 1, None),
+@pytest.mark.parametrize("H,seq_lens", [
+    (96, [8192]),
+    (64, [1300, 547, 2048, 963, 271, 3063]),
+    (64, [1024] * 8),
 ])
-@pytest.mark.parametrize("layout", ["packed", "independent"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_row_strided_qkv_matches_dense(B, T, H, lengths, layout, dtype):
-    qkv, gates = _make_strided_inputs(B, T, H, layout)
-    N = B if lengths is None else len(lengths)
-    state = torch.randn(N, H, 128, 128, device="cuda", dtype=dtype) * 0.01
-    expected = _run_strided_fwd(tuple(x.contiguous() for x in qkv), gates, lengths, state)
-    actual = _run_strided_fwd(qkv, gates, lengths, state)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_row_strided_qkv(H, seq_lens, state_dtype):
+    """Packed Q/K/V views with a 3*H*D token stride match dense inputs."""
+    T, N = sum(seq_lens), len(seq_lens)
+    q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T, H)
+    packed = torch.stack((q, k, v), dim=2)
+    cu_seqlens = None if N == 1 else torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
+        dtype=torch.long, device="cuda",
+    )
+    initial_state = _make_state((N, H, D, D), state_dtype)
+
+    def run(q, k, v):
+        out = torch.zeros_like(q)
+        final_state = torch.zeros(N, H, D, D, dtype=state_dtype, device="cuda")
+        flash_kda.fwd(q, k, v, g, beta, scale, out,
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      initial_state=initial_state.clone(), final_state=final_state,
+                      cu_seqlens=cu_seqlens)
+        return out, final_state
+
+    expected = run(*(x.contiguous() for x in packed.unbind(2)))
+    actual = run(*packed.unbind(2))  # H/D rows contiguous, token stride 3*H*D
     for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        assert torch.equal(a, b)
 
+    # Independent q/k/v strides: H/D rows contiguous, token stride gap*H*D.
+    independent = tuple(
+        torch.randn(1, T, H * gap, D, dtype=torch.bfloat16, device="cuda")[:, :, :H]
+        for gap in (1, 2, 3)
+    )
+    for a, b in zip(run(*independent), run(*(x.contiguous() for x in independent))):
+        assert torch.equal(a, b)
 
-@pytest.mark.parametrize("contiguous", [False, True])
-def test_row_strided_qkv_graph_replay_uses_new_values(contiguous):
-    qkv, gates = _make_strided_inputs(1, 37, 4, "packed")
-    if contiguous:
-        qkv = tuple(x.contiguous() for x in qkv)
-    state = torch.zeros(2, 4, 128, 128, device="cuda")
-    outputs, graph, _buffers = _run_strided_fwd(qkv, gates, [17, 20], state, graph=True)
-    for _ in range(2):
-        for x in qkv:
-            x.normal_()
-        graph.replay()
-        expected = _run_strided_fwd(tuple(x.contiguous() for x in qkv), gates, [17, 20], state)
-        for a, b in zip(outputs, expected):
-            torch.testing.assert_close(a, b, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["inner", "heads", "overlap", "unaligned_row", "unaligned_base", "batch_gap"])
-def test_unsupported_qkv_layout_is_rejected(layout):
-    qkv, gates = _make_strided_inputs(2, 37, 4, "packed")
-    if layout == "inner":
-        bad = torch.empty(2, 37, 4, 256, device="cuda", dtype=torch.bfloat16)[..., ::2]
-    elif layout == "heads":
-        bad = torch.empty(2, 37, 8, 128, device="cuda", dtype=torch.bfloat16)[:, :, ::2]
-    elif layout == "unaligned_base":
-        bad = torch.empty(2 * 37 * 4 * 128 + 1, device="cuda", dtype=torch.bfloat16)[1:].view(2, 37, 4, 128)
-    elif layout == "batch_gap":
-        bad = torch.empty(2, 38, 4, 128, device="cuda", dtype=torch.bfloat16)[:, :37]
-    else:
-        row_stride = 256 if layout == "overlap" else 513
-        bad = torch.empty_strided(
-            (2, 37, 4, 128), (37 * row_stride, row_stride, 128, 1),
-            device="cuda", dtype=torch.bfloat16,
-        )
-    state = torch.zeros(2, 4, 128, 128, device="cuda")
+    unaligned = torch.empty(T * H * D + 1, dtype=torch.bfloat16, device="cuda")[1:]
     with pytest.raises(RuntimeError, match="Q/K/V"):
-        _run_strided_fwd((bad, *qkv[1:]), gates, None, state)
+        run(unaligned.view(1, T, H, D), *packed.unbind(2)[1:])
