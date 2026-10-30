@@ -1,3 +1,5 @@
+#include <cstdint>
+
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_inl.h>
@@ -48,8 +50,8 @@ void fwd(
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
-    STD_TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
-                    "q, k, v, g, out, and workspace must be contiguous");
+    STD_TORCH_CHECK(g.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
+                    "g, out, and workspace must be contiguous");
     STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16, "q must be bfloat16");
     STD_TORCH_CHECK(k.scalar_type() == ScalarType::BFloat16, "k must be bfloat16");
     STD_TORCH_CHECK(v.scalar_type() == ScalarType::BFloat16, "v must be bfloat16");
@@ -140,6 +142,20 @@ void fwd(
     STD_TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == D, "dt_bias must be [H, D]");
 
     STD_TORCH_CHECK(D == 128, "currently only supports D == 128");
+
+    auto token_stride = [&](const Tensor& t) {
+        const int64_t stride = T_seq > 1 ? t.stride(1) : B > 1 ? t.stride(0) : H * D;
+        STD_TORCH_CHECK(
+            t.stride(3) == 1 && (H == 1 || t.stride(2) == D) &&
+            stride >= H * D && stride % 8 == 0 && stride < (int64_t(1) << 39) &&
+            (B <= 1 || T_seq <= 1 || t.stride(0) == T_seq * stride) &&
+            reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0,
+            "Q/K/V require contiguous H/D rows and TMA-aligned, uniform B*T strides");
+        return stride;
+    };
+    const int64_t q_stride = token_stride(q);
+    const int64_t k_stride = token_stride(k);
+    const int64_t v_stride = token_stride(v);
 
     auto q_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(q.const_data_ptr());
     auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k.const_data_ptr());
@@ -253,8 +269,8 @@ void fwd(
                 initial_state_raw, scale_f, final_state_raw, \
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
-                int(T_total), int(H), int(N_val), typed_cu_seqlens, \
-                A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
+                int(T_total), int(H), int(N_val), q_stride, k_stride, v_stride, \
+                typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
 
         #define DISPATCH_STATE(CKPT, VL) \
             if (!has_state_in && !has_state_out && state_fp32) { \

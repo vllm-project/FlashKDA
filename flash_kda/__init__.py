@@ -49,8 +49,9 @@ def fwd(
             automatically when omitted.
     Notes:
         * Currently requires ``K = V = 128``.
-        * Beta may be strided; other input and output tensors must be
-          contiguous.
+        * Q/K/V may have a padded token stride, with contiguous H/D rows,
+          16-byte-aligned row starts, and a uniform stride across B*T.
+          Beta may be strided. Other input and output tensors must be contiguous.
     """
     B, T_seq, H = q.shape[:3]
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B

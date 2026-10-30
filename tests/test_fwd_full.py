@@ -272,3 +272,51 @@ def test_fwd_long_varlen(seq_lens):
 
     assert torch.equal(out_kernel, out_ref), f"output mismatch: seqs={seq_lens}"
     assert torch.equal(final_k, final_r), f"final_state mismatch: seqs={seq_lens}"
+
+
+# ---------------------------------------------------------------------------
+# Row-strided Q/K/V
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("H,seq_lens", [
+    (96, [8192]),
+    (64, [1300, 547, 2048, 963, 271, 3063]),
+    (64, [1024] * 8),
+])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_row_strided_qkv(H, seq_lens, state_dtype):
+    """Packed Q/K/V views with a 3*H*D token stride match dense inputs."""
+    T, N = sum(seq_lens), len(seq_lens)
+    q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T, H)
+    packed = torch.stack((q, k, v), dim=2)
+    cu_seqlens = None if N == 1 else torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
+        dtype=torch.long, device="cuda",
+    )
+    initial_state = _make_state((N, H, D, D), state_dtype)
+
+    def run(q, k, v):
+        out = torch.zeros_like(q)
+        final_state = torch.zeros(N, H, D, D, dtype=state_dtype, device="cuda")
+        flash_kda.fwd(q, k, v, g, beta, scale, out,
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      initial_state=initial_state.clone(), final_state=final_state,
+                      cu_seqlens=cu_seqlens)
+        return out, final_state
+
+    expected = run(*(x.contiguous() for x in packed.unbind(2)))
+    actual = run(*packed.unbind(2))  # H/D rows contiguous, token stride 3*H*D
+    for a, b in zip(actual, expected):
+        assert torch.equal(a, b)
+
+    # Independent q/k/v strides: H/D rows contiguous, token stride gap*H*D.
+    independent = tuple(
+        torch.randn(1, T, H * gap, D, dtype=torch.bfloat16, device="cuda")[:, :, :H]
+        for gap in (1, 2, 3)
+    )
+    for a, b in zip(run(*independent), run(*(x.contiguous() for x in independent))):
+        assert torch.equal(a, b)
+
+    unaligned = torch.empty(T * H * D + 1, dtype=torch.bfloat16, device="cuda")[1:]
+    with pytest.raises(RuntimeError, match="Q/K/V"):
+        run(unaligned.view(1, T, H, D), *packed.unbind(2)[1:])
