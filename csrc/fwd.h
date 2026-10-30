@@ -3,6 +3,7 @@
 
 #include <cutlass/bfloat16.h>
 
+// Token strides are in elements; zero selects the dense H*D layout.
 template <
     int D,
     bool HasStateIn = true,
@@ -33,7 +34,10 @@ void launch_fwd(
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int64_t q_token_stride = 0,
+    int64_t k_token_stride = 0,
+    int64_t v_token_stride = 0
 );
 
 // The two kernels of launch_fwd as standalone launches. launch_prepare (K1)
@@ -59,7 +63,9 @@ void launch_prepare(
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int64_t q_token_stride = 0,
+    int64_t k_token_stride = 0
 );
 
 template <
@@ -85,5 +91,6 @@ void launch_recurrence(
     int N,
     SeqlenT const* cu_seqlens_ptr,
     int num_sms,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int64_t v_token_stride = 0
 );
