@@ -40,8 +40,7 @@ def bench_qkv_layouts(qkv, gates, initial_state, out, cu_seqlens, layouts,
     scale = 1.0 / math.sqrt(D)
     packed_qkv = torch.stack(qkv, dim=2).unbind(2)
     beta = torch.stack((beta, beta), dim=2)[:, :, 0]
-    cu = (cu_seqlens.to(torch.int32) if cu_seqlens is not None else
-          torch.tensor([0, T_total], dtype=torch.int32, device=device))
+    cu = cu_seqlens.to(torch.int32) if cu_seqlens is not None else None
     initial_state = initial_state.float()
     final_state = torch.empty_like(initial_state)
     workspace = torch.empty(flash_kda.get_workspace_size(T_total, H, N),
