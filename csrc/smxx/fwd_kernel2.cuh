@@ -687,6 +687,12 @@ _flash_kda_fwd_recurrence(
 
             BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
             BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
+            // Rows past the sequence end hold the next sequence's (or next
+            // head's) beta and v. INV @ u multiplies them by exact zeros, which
+            // keeps a NaN or Inf alive (0 * NaN). Zero those u rows by select.
+            const int tail_len = min(CHUNK, seq_len - t * CHUNK);
+            const bool row0_valid = group_id < tail_len;
+            const bool row1_valid = group_id + 8 < tail_len;
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
             SFragT u_bf16[kValueBlocksPerWarp];
@@ -704,6 +710,16 @@ _flash_kda_fwd_recurrence(
                         auto c1 = make_coord(make_coord(a, 1), 0, d);
                         u_bf16[i](c0) = (v_bf16[i](c0) - u_bf16[i](c0)) * beta0;
                         u_bf16[i](c1) = (v_bf16[i](c1) - u_bf16[i](c1)) * beta1;
+                    }
+                }
+                if (tail_len < CHUNK) {  // uniform per tile: full tiles skip this
+                    #pragma unroll
+                    for (int a = 0; a < 2; ++a) {
+                        #pragma unroll
+                        for (int d = 0; d < 2; ++d) {
+                            if (!row0_valid) u_bf16[i](make_coord(make_coord(a, 0), 0, d)) = BF16::bitcast(0);
+                            if (!row1_valid) u_bf16[i](make_coord(make_coord(a, 1), 0, d)) = BF16::bitcast(0);
+                        }
                     }
                 }
 
