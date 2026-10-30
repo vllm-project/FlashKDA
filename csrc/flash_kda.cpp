@@ -143,23 +143,19 @@ void fwd(
 
     STD_TORCH_CHECK(D == 128, "currently only supports D == 128");
 
-    auto token_stride = [&](const Tensor& tensor, const char* name) {
-        STD_TORCH_CHECK(tensor.stride(3) == 1 && (H == 1 || tensor.stride(2) == D),
-                        name, " must have contiguous H/D rows");
-        // Flatten B*T only when the token rows have a uniform stride.
-        int64_t stride = T_seq > 1 ? tensor.stride(1)
-            : B > 1 ? tensor.stride(0) : H * D;
-        STD_TORCH_CHECK(stride >= H * D && stride % 8 == 0 && stride < (int64_t(1) << 39),
-                        name, " token stride must cover a row and be TMA-aligned");
-        STD_TORCH_CHECK(B <= 1 || T_seq <= 1 || tensor.stride(0) == T_seq * stride,
-                        name, " batch stride must equal T times the token stride");
-        STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % 16 == 0,
-                        name, " data pointer must be 16-byte aligned");
+    auto token_stride = [&](const Tensor& t) {
+        const int64_t stride = T_seq > 1 ? t.stride(1) : B > 1 ? t.stride(0) : H * D;
+        STD_TORCH_CHECK(
+            t.stride(3) == 1 && (H == 1 || t.stride(2) == D) &&
+            stride >= H * D && stride % 8 == 0 && stride < (int64_t(1) << 39) &&
+            (B <= 1 || T_seq <= 1 || t.stride(0) == T_seq * stride) &&
+            reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0,
+            "Q/K/V require contiguous H/D rows and TMA-aligned, uniform B*T strides");
         return stride;
     };
-    const int64_t q_stride = token_stride(q, "q");
-    const int64_t k_stride = token_stride(k, "k");
-    const int64_t v_stride = token_stride(v, "v");
+    const int64_t q_stride = token_stride(q);
+    const int64_t k_stride = token_stride(k);
+    const int64_t v_stride = token_stride(v);
 
     auto q_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(q.const_data_ptr());
     auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k.const_data_ptr());
@@ -273,9 +269,8 @@ void fwd(
                 initial_state_raw, scale_f, final_state_raw, \
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
-                int(T_total), int(H), int(N_val), typed_cu_seqlens, \
-                A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream, \
-                q_stride, k_stride, v_stride)
+                int(T_total), int(H), int(N_val), q_stride, k_stride, v_stride, \
+                typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
 
         #define DISPATCH_STATE(CKPT, VL) \
             if (!has_state_in && !has_state_out && state_fp32) { \

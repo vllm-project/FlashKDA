@@ -34,15 +34,15 @@ static void launch_kernels(
     int T_total,
     int H,
     int N,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t v_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream,
-    int64_t q_token_stride,
-    int64_t k_token_stride,
-    int64_t v_token_stride
+    cudaStream_t stream
 ) {
     using BF16 = cutlass::bfloat16_t;
     constexpr int kInputStages = 3;
@@ -308,23 +308,23 @@ void launch_fwd(
     int T_total,
     int H,
     int N,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t v_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream,
-    int64_t q_token_stride,
-    int64_t k_token_stride,
-    int64_t v_token_stride
+    cudaStream_t stream
 ) {
     launch_kernels<true, true, D, HasStateIn, HasStateOut, StateFP32,
                    HasCheckpoint, IsVarlen, SeqlenT>(
         q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
-        workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr, A_log_ptr,
-        dt_bias_ptr, gate_scale, num_sms, stream,
-        q_token_stride, k_token_stride, v_token_stride);
+        workspace_ptr, total_tiles, T_total, H, N,
+        q_token_stride, k_token_stride, v_token_stride, cu_seqlens_ptr, A_log_ptr,
+        dt_bias_ptr, gate_scale, num_sms, stream);
 }
 
 // ==================== launch_prepare ====================
@@ -350,7 +350,7 @@ void launch_prepare(
                    SeqlenT>(
         q_ptr, k_ptr, nullptr, g_bf16_ptr, beta_ptr, nullptr, scale, nullptr,
         nullptr, nullptr, nullptr, workspace_ptr, total_tiles, T_total, H, N,
-        cu_seqlens_ptr, A_log_ptr, dt_bias_ptr, gate_scale, 0, stream, 0, 0, 0);
+        0, 0, 0, cu_seqlens_ptr, A_log_ptr, dt_bias_ptr, gate_scale, 0, stream);
 }
 
 // ==================== launch_recurrence ====================
@@ -383,8 +383,8 @@ void launch_recurrence(
                    HasCheckpoint, IsVarlen, SeqlenT>(
         nullptr, nullptr, v_ptr, nullptr, beta_ptr, initial_state_ptr, 0.0f,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
-        workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr, nullptr,
-        nullptr, 0.0f, num_sms, stream, 0, 0, 0);
+        workspace_ptr, total_tiles, T_total, H, N, 0, 0, 0, cu_seqlens_ptr, nullptr,
+        nullptr, 0.0f, num_sms, stream);
 }
 
 // Explicit instantiations
@@ -394,9 +394,9 @@ void launch_recurrence(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
         void*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
-        int, int, int, int, \
+        int, int, int, int, int64_t, int64_t, int64_t, \
         SEQLEN_T const*, float const*, float const*, float, int, \
-        cudaStream_t, int64_t, int64_t, int64_t);
+        cudaStream_t);
 
 #define INSTANTIATE_LAUNCH_RECURRENCE(D, HI, HO, FP32, CKPT, VL, SEQLEN_T) \
     template void launch_recurrence<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \

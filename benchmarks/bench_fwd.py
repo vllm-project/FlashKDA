@@ -5,8 +5,6 @@ import math
 from fla.ops.kda import chunk_kda
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-LOWER_BOUND = -5.0
-
 def bench_fn(fn, warmup, iters, repeats):
     for _ in range(max(warmup, 1)):
         fn()
@@ -32,46 +30,9 @@ def bench_fn(fn, warmup, iters, repeats):
     return mean, mn, mx
 
 
-def bench_qkv_layouts(qkv, gates, initial_state, out, cu_seqlens, layouts,
-                     warmup, iters, repeats):
-    q = qkv[0]
-    g, beta, A_log, dt_bias = gates
-    _, T_total, H, D = q.shape
-    N = initial_state.shape[0]
-    device = q.device
-    scale = 1.0 / math.sqrt(D)
-    packed_qkv = torch.stack(qkv, dim=2).unbind(2)
-    beta = torch.stack((beta, beta), dim=2)[:, :, 0]
-    cu = cu_seqlens.to(torch.int32) if cu_seqlens is not None else None
-    initial_state = initial_state.float()
-    final_state = torch.empty_like(initial_state)
-    workspace = torch.empty(flash_kda.get_workspace_size(T_total, H, N),
-                            dtype=torch.uint8, device=device)
-
-    def call(inputs):
-        torch.ops.flash_kda.fwd(
-            *inputs, g, beta, scale, out, workspace, A_log, dt_bias,
-            LOWER_BOUND, initial_state, final_state, cu, None, None,
-        )
-
-    call(qkv)
-    expected = out.clone(), final_state.clone()
-    for layout in layouts:
-        def run_layout():
-            if layout == "copies":
-                call(tuple(x.contiguous() for x in packed_qkv))
-            else:
-                call(packed_qkv if layout == "strided" else qkv)
-
-        run_layout()
-        for actual, reference in zip((out, final_state), expected):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        mean, mn, mx = bench_fn(run_layout, warmup, iters, repeats)
-        print(f"  flash_kda (fp32 state, {layout}) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms", flush=True)
-
-
-def run_case(seq_lens, H, D, warmup, iters, repeats, qkv_layouts=None):
+def run_case(seq_lens, H, D, warmup, iters, repeats):
     device = torch.device("cuda")
+    LOWER_BOUND = -5.0
     scale_float = 1.0 / math.sqrt(D)
 
     varlen = len(seq_lens) > 1
@@ -101,11 +62,6 @@ def run_case(seq_lens, H, D, warmup, iters, repeats, qkv_layouts=None):
     final_state = torch.zeros_like(initial_state)
     out = torch.zeros_like(q)
     scale = scale_float
-
-    if qkv_layouts:
-        bench_qkv_layouts((q, k, v), (g, beta, A_log, dt_bias), initial_state,
-                         out, extra.get("cu_seqlens"), qkv_layouts, warmup, iters, repeats)
-        return
 
     # --- flash_kda: bf16 state ---
     def run_flash_kda():
@@ -195,9 +151,6 @@ def main():
     p.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
     p.add_argument("--H", type=int, default=96)
     p.add_argument("--D", type=int, default=128)
-    p.add_argument("--seq-lens", type=int, nargs="+", help="Override the built-in sequence-length cases")
-    p.add_argument("--qkv-layouts", nargs="+", choices=["dense", "copies", "strided"],
-                   help="Compare QKV layouts with the native call and preallocated workspace")
     args = p.parse_args()
 
     cases = []
@@ -205,13 +158,9 @@ def main():
         cases.extend(FIXED_CASES)
     if args.mode in ("varlen", "all"):
         cases.extend(VARLEN_CASES)
-    if args.seq_lens:
-        cases = [args.seq_lens]
-    if args.qkv_layouts:
-        torch.manual_seed(42)
 
     for seq_lens in cases:
-        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats, args.qkv_layouts)
+        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats)
 
 
 if __name__ == "__main__":

@@ -29,15 +29,15 @@ void launch_fwd(
     int T_total,
     int H,
     int N,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t v_token_stride,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
     int num_sms,
-    cudaStream_t stream,
-    int64_t q_token_stride = 0,
-    int64_t k_token_stride = 0,
-    int64_t v_token_stride = 0
+    cudaStream_t stream
 );
 
 // The two kernels of launch_fwd as standalone launches. launch_prepare (K1)
