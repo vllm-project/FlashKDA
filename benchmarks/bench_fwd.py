@@ -3,6 +3,8 @@ import flash_kda
 import torch.nn.functional as F
 import math
 
+LOWER_BOUND = -5.0
+
 def bench_fn(fn, warmup, iters, repeats):
     for _ in range(max(warmup, 1)):
         fn()
@@ -28,9 +30,47 @@ def bench_fn(fn, warmup, iters, repeats):
     return mean, mn, mx
 
 
+def bench_qkv_layouts(qkv, gates, initial_state, out, cu_seqlens, layouts,
+                     warmup, iters, repeats):
+    q = qkv[0]
+    g, beta, A_log, dt_bias = gates
+    _, T_total, H, D = q.shape
+    N = initial_state.shape[0]
+    device = q.device
+    scale = 1.0 / math.sqrt(D)
+    packed_qkv = torch.stack(qkv, dim=2).unbind(2)
+    beta = torch.stack((beta, beta), dim=2)[:, :, 0]
+    cu = (cu_seqlens.to(torch.int32) if cu_seqlens is not None else
+          torch.tensor([0, T_total], dtype=torch.int32, device=device))
+    initial_state = initial_state.float()
+    final_state = torch.empty_like(initial_state)
+    workspace = torch.empty(flash_kda.get_workspace_size(T_total, H, N),
+                            dtype=torch.uint8, device=device)
+
+    def call(inputs):
+        torch.ops.flash_kda.fwd(
+            *inputs, g, beta, scale, out, workspace, A_log, dt_bias,
+            LOWER_BOUND, initial_state, final_state, cu, None, None,
+        )
+
+    call(qkv)
+    expected = out.clone(), final_state.clone()
+    for layout in layouts:
+        def run_layout():
+            if layout == "copies":
+                call(tuple(x.contiguous() for x in packed_qkv))
+            else:
+                call(packed_qkv if layout == "strided" else qkv)
+
+        run_layout()
+        for actual, reference in zip((out, final_state), expected):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        mean, mn, mx = bench_fn(run_layout, warmup, iters, repeats)
+        print(f"  flash_kda (fp32 state, {layout}) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms", flush=True)
+
+
 def run_case(seq_lens, H, D, warmup, iters, repeats, qkv_layouts=None):
     device = torch.device("cuda")
-    LOWER_BOUND = -5.0
     scale_float = 1.0 / math.sqrt(D)
 
     varlen = len(seq_lens) > 1
@@ -62,35 +102,8 @@ def run_case(seq_lens, H, D, warmup, iters, repeats, qkv_layouts=None):
     scale = scale_float
 
     if qkv_layouts:
-        packed_qkv = torch.stack((q, k, v), dim=2).unbind(2)
-        beta = torch.stack((beta, beta), dim=2)[:, :, 0]
-        cu = (cu_seqlens.to(torch.int32) if varlen else
-              torch.tensor([0, T_total], dtype=torch.int32, device=device))
-        initial_state = initial_state.float()
-        final_state = torch.empty_like(initial_state)
-        workspace = torch.empty(flash_kda.get_workspace_size(T_total, H, N),
-                                dtype=torch.uint8, device=device)
-
-        def call(inputs):
-            torch.ops.flash_kda.fwd(
-                *inputs, g, beta, scale, out, workspace, A_log, dt_bias,
-                LOWER_BOUND, initial_state, final_state, cu, None, None,
-            )
-
-        call((q, k, v))
-        expected = out.clone(), final_state.clone()
-        for layout in qkv_layouts:
-            def run_layout():
-                if layout == "copies":
-                    call(tuple(x.contiguous() for x in packed_qkv))
-                else:
-                    call(packed_qkv if layout == "strided" else (q, k, v))
-
-            run_layout()
-            for actual, reference in zip((out, final_state), expected):
-                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-            mean, mn, mx = bench_fn(run_layout, warmup, iters, repeats)
-            print(f"  flash_kda (fp32 state, {layout}) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms", flush=True)
+        bench_qkv_layouts((q, k, v), (g, beta, A_log, dt_bias), initial_state,
+                         out, extra.get("cu_seqlens"), qkv_layouts, warmup, iters, repeats)
         return
 
     # --- flash_kda: bf16 state ---

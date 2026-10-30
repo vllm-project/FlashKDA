@@ -63,9 +63,7 @@ void launch_prepare(
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
-    cudaStream_t stream,
-    int64_t q_token_stride = 0,
-    int64_t k_token_stride = 0
+    cudaStream_t stream
 );
 
 template <
@@ -91,6 +89,5 @@ void launch_recurrence(
     int N,
     SeqlenT const* cu_seqlens_ptr,
     int num_sms,
-    cudaStream_t stream,
-    int64_t v_token_stride = 0
+    cudaStream_t stream
 );
