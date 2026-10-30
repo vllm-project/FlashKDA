@@ -2,6 +2,8 @@ import torch
 import flash_kda
 import torch.nn.functional as F
 import math
+from fla.ops.kda import chunk_kda
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 LOWER_BOUND = -5.0
 
@@ -135,9 +137,6 @@ def run_case(seq_lens, H, D, warmup, iters, repeats, qkv_layouts=None):
     print(f"  flash_kda (fp32 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
 
     # --- chunk_kda ---
-    from fla.ops.kda import chunk_kda
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
     h0_ck = initial_state.float()
 
     def run_chunk_kda():
