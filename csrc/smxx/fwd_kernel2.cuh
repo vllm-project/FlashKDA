@@ -712,14 +712,12 @@ _flash_kda_fwd_recurrence(
                         u_bf16[i](c1) = (v_bf16[i](c1) - u_bf16[i](c1)) * beta1;
                     }
                 }
-                if (tail_len < CHUNK) {  // uniform per tile: full tiles skip this
+                #pragma unroll
+                for (int a = 0; a < 2; ++a) {
                     #pragma unroll
-                    for (int a = 0; a < 2; ++a) {
-                        #pragma unroll
-                        for (int d = 0; d < 2; ++d) {
-                            if (!row0_valid) u_bf16[i](make_coord(make_coord(a, 0), 0, d)) = BF16::bitcast(0);
-                            if (!row1_valid) u_bf16[i](make_coord(make_coord(a, 1), 0, d)) = BF16::bitcast(0);
-                        }
+                    for (int d = 0; d < 2; ++d) {
+                        if (!row0_valid) u_bf16[i](make_coord(make_coord(a, 0), 0, d)) = BF16::bitcast(0);
+                        if (!row1_valid) u_bf16[i](make_coord(make_coord(a, 1), 0, d)) = BF16::bitcast(0);
                     }
                 }
 
