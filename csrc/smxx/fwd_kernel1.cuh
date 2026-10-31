@@ -241,11 +241,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int compute_tid = threadIdx.x;
     int beta_smem_offset = (head_idx * T_total + int(bos) + local_t * CHUNK) & 7;
     int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
-    // The 32-wide beta TMA box also covers tokens past this sequence's end:
-    // the next sequence of the same head, or the first tokens of the next
-    // head for the last sequence. Rows past actual_len must not see them:
-    // L(i, j) * beta_act[i] keeps a NaN there (0 * NaN), and the inverse and
-    // INV @ u then spread it to the valid rows. Select 0, do not multiply.
+    // The beta TMA box also covers tokens past the sequence end. Select 0 for
+    // those rows instead of multiplying by 0: 0 * NaN is NaN.
     if (compute_tid < CHUNK) {
         shared_storage.beta_act.begin()[compute_tid] = compute_tid < actual_len
             ? sigmoid_tanh_approx_f32(

@@ -687,9 +687,8 @@ _flash_kda_fwd_recurrence(
 
             BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
             BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
-            // Rows past the sequence end hold the next sequence's (or next
-            // head's) beta and v. INV @ u multiplies them by exact zeros, which
-            // keeps a NaN or Inf alive (0 * NaN). Zero those u rows by select.
+            // Rows past the sequence end hold another sequence's beta and v.
+            // Zero them by select: 0 * NaN is NaN.
             const int tail_len = min(CHUNK, seq_len - t * CHUNK);
             const bool row0_valid = group_id < tail_len;
             const bool row1_valid = group_id + 8 < tail_len;

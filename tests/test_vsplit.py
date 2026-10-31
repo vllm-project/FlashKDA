@@ -284,11 +284,8 @@ def test_vsplit_varlen_exact(
 def test_varlen_nan_neighbour_does_not_leak(
     tensor: str, state_case: StateCase, fillers: int
 ) -> None:
-    # The 17-token victim's tail chunk also loads the 15 rows after its end:
-    # the next sequence, or for the last sequence the next head's first
-    # tokens. A NaN there must not reach it (0 * NaN is NaN). The beta case
-    # poisons token 0 with the victim last; the v case poisons the token right
-    # after a leading victim. 256 one-token fillers force the full-width K2.
+    # The victim's tail chunk also loads the 15 rows after its end; a NaN there
+    # must not leak in. 256 one-token fillers force the full-width K2.
     victim_last = tensor == "beta"
     ones = [1] * (fillers + 1)
     lengths = ones + [17] if victim_last else [17] + ones
