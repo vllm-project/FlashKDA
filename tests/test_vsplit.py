@@ -276,3 +276,33 @@ def test_vsplit_varlen_exact(
     state_case: StateCase, cu_dtype: torch.dtype
 ) -> None:
     _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)
+
+
+@pytest.mark.parametrize("fillers", (0, 256), ids=("vsplit", "full_width"))
+@pytest.mark.parametrize("state_case", STATE_CASES[-2:], ids=lambda case: case.name)
+@pytest.mark.parametrize("tensor", ("beta", "v"))
+def test_varlen_nan_neighbour_does_not_leak(
+    tensor: str, state_case: StateCase, fillers: int
+) -> None:
+    # The victim's tail chunk also loads the 15 rows after its end; a NaN there
+    # must not leak in. 256 one-token fillers force the full-width K2.
+    victim_last = tensor == "beta"
+    ones = [1] * (fillers + 1)
+    lengths = ones + [17] if victim_last else [17] + ones
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    problem = _make_problem(
+        batch=1,
+        seq_len=offsets[-1],
+        cu_seqlens=cu_seqlens,
+        num_sequences=len(lengths),
+        seed=505,
+    )
+    getattr(problem, tensor)[0, 0 if victim_last else 17] = float("nan")
+    victim = len(lengths) - 1 if victim_last else 0
+    template = _state_template(problem, state_case)
+    out, state = _run_kernel(problem, state_case, template)
+    assert torch.isfinite(out[0, offsets[victim]:offsets[victim + 1]]).all()
+    assert torch.isfinite(state[victim]).all()
