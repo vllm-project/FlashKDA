@@ -195,49 +195,59 @@ static void launch_kernels(
         dim3 block_k2(kK2Threads);
 
         // V-split doubles the blocks per head. Use it while its grid fits in
-        // one wave.
+        // one wave; check occupancy before constructing V-split TensorMaps.
         const int vsplit_blocks = H * (D / VD) * N;
         if (vsplit_blocks <= 2 * num_sms) {
-            // Keep the default path's host launch overhead unchanged: split
-            // TensorMaps are constructed only when this path may be used.
-            auto tma_load_v_vsplit = make_tma_copy(
-                SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{});
-            auto tma_store_out_vsplit = make_tma_copy(
-                SM90_TMA_STORE{}, m_out, K2VSplitTMAVOLayout{});
-            auto [tma_load_initial_state_vsplit,
-                  tma_store_final_state_vsplit] =
-                make_state_tma(K2VSplitTMAStateSmemLayout{},
-                               K2VSplitTMAFP32StateSmemLayout{});
+            using TmaLoadVVSplit = decltype(make_tma_copy(
+                SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{}));
+            using TmaStoreOutVSplit = decltype(make_tma_copy(
+                SM90_TMA_STORE{}, m_out, K2VSplitTMAVOLayout{}));
+            using StateTmaVSplit = decltype(make_state_tma(
+                K2VSplitTMAStateSmemLayout{}, K2VSplitTMAFP32StateSmemLayout{}));
+            using TmaLoadStateVSplit = std::tuple_element_t<0, StateTmaVSplit>;
+            using TmaStoreStateVSplit = std::tuple_element_t<1, StateTmaVSplit>;
 
             using SharedStorageK2T = SharedStorageK2<
                 K2VSplitL, kInputStages, kOutputStages>;
             int smem_size_k2 = sizeof(SharedStorageK2T);
-            dim3 grid_k2(H * (D / VD), N);
 
             auto kernel2 = _flash_kda_fwd_recurrence<
-                decltype(tma_load_v_vsplit),
+                TmaLoadVVSplit,
                 decltype(tma_load_beta2),
-                decltype(tma_load_initial_state_vsplit),
-                decltype(tma_store_final_state_vsplit),
-                decltype(tma_store_out_vsplit),
+                TmaLoadStateVSplit,
+                TmaStoreStateVSplit,
+                TmaStoreOutVSplit,
                 CHUNK, D, kInputStages, kOutputStages, kK2VSplitThreads,
                 HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
                 IsVarlen, SeqlenT,
                 VD>;
 
-            cudaFuncSetAttribute(
-                kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                smem_size_k2);
             int blocks_per_sm = 1;
             // On sm_10x a V-split grid at two blocks per SM is slower than full width.
             cudaFuncAttributes attr;
             if (vsplit_blocks > num_sms &&
                 cudaFuncGetAttributes(&attr, kernel2) == cudaSuccess &&
                 attr.binaryVersion / 10 != 10) {
+                cudaFuncSetAttribute(
+                    kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_size_k2);
                 cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                     &blocks_per_sm, kernel2, kK2VSplitThreads, smem_size_k2);
             }
             if (vsplit_blocks <= blocks_per_sm * num_sms) {
+                auto tma_load_v_vsplit = make_tma_copy(
+                    SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{});
+                auto tma_store_out_vsplit = make_tma_copy(
+                    SM90_TMA_STORE{}, m_out, K2VSplitTMAVOLayout{});
+                auto [tma_load_initial_state_vsplit,
+                      tma_store_final_state_vsplit] =
+                    make_state_tma(K2VSplitTMAStateSmemLayout{},
+                                   K2VSplitTMAFP32StateSmemLayout{});
+
+                cudaFuncSetAttribute(
+                    kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_size_k2);
+                dim3 grid_k2(H * (D / VD), N);
                 kernel2<<<grid_k2, dim3(kK2VSplitThreads), smem_size_k2, stream>>>(
                     tma_load_v_vsplit, tma_load_beta2,
                     tma_load_initial_state_vsplit,

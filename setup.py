@@ -80,7 +80,7 @@ ext_modules = [
                 '--expt-relaxed-constexpr',
                 '--expt-extended-lambda',
                 '--use_fast_math',
-                '--ptxas-options=-v,--register-usage-level=10,--warn-on-spills',
+                '--ptxas-options=-v,--warn-on-spills',
                 '-lineinfo',
                 *get_nvcc_thread_args(),
                 *get_arch_flags(),
