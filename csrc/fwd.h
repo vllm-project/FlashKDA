@@ -8,12 +8,8 @@
 // Token strides are in elements; zero selects the dense H*D layout.
 template <
     int D,
-    bool HasStateIn = true,
-    bool HasStateOut = true,
     bool StateFP32 = false,
-    bool HasCheckpoint = false,
-    bool IsVarlen = true,
-    typename SeqlenT = int64_t>
+    bool HasCheckpoint = false>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
@@ -24,7 +20,7 @@ void launch_fwd(
     float scale,
     void* final_state_ptr,
     void* checkpoint_state_ptr,
-    SeqlenT const* checkpoint_offsets_ptr,
+    int32_t const* checkpoint_offsets_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
     int total_tiles,
@@ -34,7 +30,7 @@ void launch_fwd(
     int64_t q_token_stride,
     int64_t k_token_stride,
     int64_t v_token_stride,
-    SeqlenT const* cu_seqlens_ptr,
+    int32_t const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
@@ -46,10 +42,7 @@ void launch_fwd(
 // fills ``workspace`` from q, k, g and beta; launch_recurrence (K2) reads
 // that workspace with v and beta and writes ``out`` and the states. Both
 // must use the same geometry (total_tiles, T_total, H, N, cu_seqlens).
-template <
-    int D,
-    bool IsVarlen = true,
-    typename SeqlenT = int64_t>
+template <int D>
 void launch_prepare(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
@@ -63,7 +56,7 @@ void launch_prepare(
     int N,
     int64_t q_token_stride,
     int64_t k_token_stride,
-    SeqlenT const* cu_seqlens_ptr,
+    int32_t const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
     float gate_scale,
@@ -72,19 +65,15 @@ void launch_prepare(
 
 template <
     int D,
-    bool HasStateIn = true,
-    bool HasStateOut = true,
     bool StateFP32 = false,
-    bool HasCheckpoint = false,
-    bool IsVarlen = true,
-    typename SeqlenT = int64_t>
+    bool HasCheckpoint = false>
 void launch_recurrence(
     cutlass::bfloat16_t const* v_ptr,
     cutlass::bfloat16_t const* beta_ptr,
     void const* initial_state_ptr,
     void* final_state_ptr,
     void* checkpoint_state_ptr,
-    SeqlenT const* checkpoint_offsets_ptr,
+    int32_t const* checkpoint_offsets_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
     int total_tiles,
@@ -92,7 +81,7 @@ void launch_recurrence(
     int H,
     int N,
     int64_t v_token_stride,
-    SeqlenT const* cu_seqlens_ptr,
+    int32_t const* cu_seqlens_ptr,
     int num_sms,
     cudaStream_t stream
 );

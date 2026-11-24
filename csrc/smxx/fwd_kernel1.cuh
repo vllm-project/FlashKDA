@@ -86,9 +86,7 @@ template <
     class TmaLoadDtBias,
     int CHUNK,
     int D,
-    int NumThreads,
-    bool IsVarlen = true,
-    typename SeqlenT = int64_t
+    int NumThreads
 >
 __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
@@ -100,7 +98,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int T_total,
     int H,
     int N,
-    SeqlenT const* cu_seqlens,
+    int32_t const* cu_seqlens,
     int total_tiles,
     float const* A_log_ptr,
     float gate_scale,
@@ -143,31 +141,21 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int64_t bos, eos;
     int seq_len, t_tiles_this_seq;
 
-    if constexpr (IsVarlen) {
-        // Linear scan on cu_seqlens to find (seq_idx, local_t)
-        seq_idx = 0;
-        tiles_before = 0;
-        for (int i = 0; i < N; i++) {
-            int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
-            int n_tiles = (slen + CHUNK - 1) / CHUNK;
-            if (tiles_before + n_tiles > global_tile_idx) {
-                seq_idx = i;
-                break;
-            }
-            tiles_before += n_tiles;
+    // Linear scan on cu_seqlens to find (seq_idx, local_t)
+    seq_idx = 0;
+    tiles_before = 0;
+    for (int i = 0; i < N; i++) {
+        int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
+        int n_tiles = (slen + CHUNK - 1) / CHUNK;
+        if (tiles_before + n_tiles > global_tile_idx) {
+            seq_idx = i;
+            break;
         }
-        local_t = global_tile_idx - tiles_before;
-        bos = cu_seqlens[seq_idx];
-        eos = cu_seqlens[seq_idx + 1];
-    } else {
-        int T_seq = T_total / N;
-        int tiles_per_seq = (T_seq + CHUNK - 1) / CHUNK;
-        seq_idx = global_tile_idx / tiles_per_seq;
-        tiles_before = seq_idx * tiles_per_seq;
-        local_t = global_tile_idx - tiles_before;
-        bos = seq_idx * T_seq;
-        eos = bos + T_seq;
+        tiles_before += n_tiles;
     }
+    local_t = global_tile_idx - tiles_before;
+    bos = cu_seqlens[seq_idx];
+    eos = cu_seqlens[seq_idx + 1];
     seq_len = int(eos - bos);
     t_tiles_this_seq = (seq_len + CHUNK - 1) / CHUNK;
     // Early exit for excess CTAs (total_tiles is an upper bound)

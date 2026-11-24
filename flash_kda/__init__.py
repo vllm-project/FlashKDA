@@ -54,7 +54,20 @@ def fwd(
           Beta may be strided. Other input and output tensors must be contiguous.
     """
     B, T_seq, H = q.shape[:3]
-    N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(
+            0, (B + 1) * T_seq, T_seq, dtype=torch.int32, device=q.device
+        )
+        if B > 1:
+            q = q.reshape(1, B * T_seq, H, -1)
+            k = k.reshape(1, B * T_seq, H, -1)
+            v = v.reshape(1, B * T_seq, H, -1)
+            g = g.reshape(1, B * T_seq, H, -1)
+            beta = beta.reshape(1, B * T_seq, H)
+            out = out.view(1, B * T_seq, H, -1)
+    elif cu_seqlens.dtype == torch.int64:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+    N = cu_seqlens.numel() - 1
     if workspace is None:
         workspace = torch.empty(
             get_workspace_size(B * T_seq, H, N),
