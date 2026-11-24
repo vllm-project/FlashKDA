@@ -82,6 +82,7 @@ ext_modules = [
                 '--use_fast_math',
                 '--ptxas-options=-v,--warn-on-spills',
                 '-lineinfo',
+                '-DNDEBUG',
                 *get_nvcc_thread_args(),
                 *get_arch_flags(),
             ],

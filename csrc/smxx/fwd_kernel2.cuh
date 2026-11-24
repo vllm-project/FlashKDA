@@ -384,6 +384,7 @@ _flash_kda_fwd_recurrence(
             reinterpret_cast<float*>(shared_storage.state_fp32_buf),
             shared_storage.state_acc.begin(),
             threadIdx.x);
+        cutlass::arch::fence_view_async_shared();
         __syncthreads();
     } else {
         // No state in: zero-initialize state_acc
