@@ -72,11 +72,11 @@ def fwd(
                 raise ValueError(
                     f"beta must have shape {(B, T_seq, H)}, got {tuple(beta.shape)}"
                 )
-            q = q.reshape(1, B * T_seq, H, D)
-            k = k.reshape(1, B * T_seq, H, D)
-            v = v.reshape(1, B * T_seq, H, D)
-            g = g.reshape(1, B * T_seq, H, D)
-            beta = beta.reshape(1, B * T_seq, H)
+            q = q.view(1, B * T_seq, H, D)
+            k = k.view(1, B * T_seq, H, D)
+            v = v.view(1, B * T_seq, H, D)
+            g = g.view(1, B * T_seq, H, D)
+            beta = beta.view(1, B * T_seq, H)
             out = out.view(1, B * T_seq, H, D)
     elif cu_seqlens.dtype == torch.int64:
         cu_seqlens = cu_seqlens.to(torch.int32)

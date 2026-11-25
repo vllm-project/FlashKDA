@@ -251,15 +251,15 @@ void fwd(
 
     if (has_checkpoint) {
         if (state_fp32) {
-            LAUNCH(StateDtype::FP32, true);
+            LAUNCH(FlashKdaStateDtype::FP32, true);
         } else {
-            LAUNCH(StateDtype::BF16, true);
+            LAUNCH(FlashKdaStateDtype::BF16, true);
         }
     } else {
         if (state_fp32) {
-            LAUNCH(StateDtype::FP32, false);
+            LAUNCH(FlashKdaStateDtype::FP32, false);
         } else {
-            LAUNCH(StateDtype::BF16, false);
+            LAUNCH(FlashKdaStateDtype::BF16, false);
         }
     }
 

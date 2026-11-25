@@ -5,12 +5,13 @@
 
 #include <cutlass/bfloat16.h>
 
-enum class StateDtype { BF16, FP32 };
+enum class FlashKdaStateDtype { BF16, FP32 };
 
 // Token strides are in elements; zero selects the dense H*D layout.
+// Non-null initial_state_ptr / final_state_ptr enables state load / store.
 template <
     int D,
-    StateDtype StateT = StateDtype::BF16,
+    FlashKdaStateDtype StateT = FlashKdaStateDtype::BF16,
     bool HasCheckpoint = false>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
@@ -67,7 +68,7 @@ void launch_prepare(
 
 template <
     int D,
-    StateDtype StateT = StateDtype::BF16,
+    FlashKdaStateDtype StateT = FlashKdaStateDtype::BF16,
     bool HasCheckpoint = false>
 void launch_recurrence(
     cutlass::bfloat16_t const* v_ptr,

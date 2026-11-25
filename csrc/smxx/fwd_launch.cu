@@ -293,7 +293,7 @@ static void launch_kernels(
 // ==================== launch_fwd ====================
 template <
     int D,
-    StateDtype StateT,
+    FlashKdaStateDtype StateT,
     bool HasCheckpoint>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
@@ -322,7 +322,7 @@ void launch_fwd(
     int num_sms,
     cudaStream_t stream
 ) {
-    launch_kernels<true, true, D, StateT == StateDtype::FP32, HasCheckpoint>(
+    launch_kernels<true, true, D, StateT == FlashKdaStateDtype::FP32, HasCheckpoint>(
         q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
         workspace_ptr, total_tiles, T_total, H, N,
@@ -361,7 +361,7 @@ void launch_prepare(
 // ==================== launch_recurrence ====================
 template <
     int D,
-    StateDtype StateT,
+    FlashKdaStateDtype StateT,
     bool HasCheckpoint>
 void launch_recurrence(
     cutlass::bfloat16_t const* v_ptr,
@@ -381,7 +381,7 @@ void launch_recurrence(
     int num_sms,
     cudaStream_t stream
 ) {
-    launch_kernels<false, true, D, StateT == StateDtype::FP32, HasCheckpoint>(
+    launch_kernels<false, true, D, StateT == FlashKdaStateDtype::FP32, HasCheckpoint>(
         nullptr, nullptr, v_ptr, nullptr, beta_ptr, initial_state_ptr, 0.0f,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
         workspace_ptr, total_tiles, T_total, H, N, 0, 0, v_token_stride,
@@ -410,10 +410,10 @@ void launch_recurrence(
     INSTANTIATE_LAUNCH_FWD(128, STATE_T, CKPT) \
     INSTANTIATE_LAUNCH_RECURRENCE(128, STATE_T, CKPT)
 
-INSTANTIATE_VARIANTS(StateDtype::BF16, false)
-INSTANTIATE_VARIANTS(StateDtype::BF16, true)
-INSTANTIATE_VARIANTS(StateDtype::FP32, false)
-INSTANTIATE_VARIANTS(StateDtype::FP32, true)
+INSTANTIATE_VARIANTS(FlashKdaStateDtype::BF16, false)
+INSTANTIATE_VARIANTS(FlashKdaStateDtype::BF16, true)
+INSTANTIATE_VARIANTS(FlashKdaStateDtype::FP32, false)
+INSTANTIATE_VARIANTS(FlashKdaStateDtype::FP32, true)
 
 template void launch_prepare<128>(
     cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
