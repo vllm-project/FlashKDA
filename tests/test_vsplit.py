@@ -2,7 +2,7 @@
 
 The cases are deliberately small (``H=2`` and at most 64 tokens) so this file
 is suitable for the focused B300 test entry.  Coverage is nevertheless across
-fixed and varlen dispatch, both cu_seqlens integer types, empty sequences, all
+single-sequence, multi-sequence, and empty-sequence varlen dispatch, all
 state input/output modes, and both supported state dtypes.  The automatic
 dispatch selects V-split for these low-parallelism cases, and every result is
 compared directly and bit-for-bit with ``torch_ref``.

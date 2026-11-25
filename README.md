@@ -83,7 +83,7 @@ bash tests/test.sh
 
 ```python
 flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-              initial_state=None, final_state=None, cu_seqlens=None,
+              cu_seqlens, initial_state=None, final_state=None,
               workspace=None)
 ```
 
@@ -91,25 +91,23 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 
 | Parameter | Dtype | Shape | Description |
 |---|---|---|---|
-| `q` | bf16 | `[B, T, H, K]` | Query |
-| `k` | bf16 | `[B, T, H, K]` | Key |
-| `v` | bf16 | `[B, T, H, V]` | Value |
-| `g` | bf16 | `[B, T, H, K]` | Gate before activation |
-| `beta` | bf16 | `[B, T, H]` | Beta logits (pre-activation; sigmoid applied internally) |
+| `q` | bf16 | `[1, T, H, K]` | Query |
+| `k` | bf16 | `[1, T, H, K]` | Key |
+| `v` | bf16 | `[1, T, H, V]` | Value |
+| `g` | bf16 | `[1, T, H, K]` | Gate before activation |
+| `beta` | bf16 | `[1, T, H]` | Beta logits (pre-activation; sigmoid applied internally) |
 | `scale` | float | scalar | scaling factor |
-| `out` | bf16 | `[B, T, H, V]` | Output tensor |
+| `out` | bf16 | `[1, T, H, V]` | Output tensor |
 | `A_log` | fp32 | `[H]` | Log-gate parameter |
 | `dt_bias` | fp32 | `[H, K]` | Gate bias |
 | `lower_bound` | float | scalar | Gate lower bound (range from -5.0 to 0) |
-| `initial_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional) Initial recurrent state |
-| `final_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional, output) Final recurrent state |
-| `cu_seqlens` | int32/int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
+| `cu_seqlens` | int32 | `[N+1]` | Cumulative sequence lengths for packed variable-length batching |
+| `initial_state` | bf16/fp32/None | `[N, H, V, K]` | (optional) Initial recurrent state |
+| `final_state` | bf16/fp32/None | `[N, H, V, K]` | (optional, output) Final recurrent state |
 | `workspace` | uint8/None | `[workspace_size]` | (optional) Reusable workspace; allocated automatically when omitted |
 
-- Currently requires `K = V = 128`.
-- `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
-- When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
-- When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
+- Currently requires `K = V = 128` and `B = 1` (packed varlen, where `T` is the total length across all `N` sequences).
+- `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors of shape `[N, H, V, K]`. When both are provided, their dtypes must match.
 - K2 automatically splits the value dimension into two `V=64` CTAs when
   `2 * H * N <= SM count`, targeting workloads with insufficient CTA-level
   parallelism.
