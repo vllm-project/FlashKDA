@@ -293,7 +293,7 @@ static void launch_kernels(
 // ==================== launch_fwd ====================
 template <
     int D,
-    bool StateFP32,
+    StateDtype StateT,
     bool HasCheckpoint>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
@@ -322,7 +322,7 @@ void launch_fwd(
     int num_sms,
     cudaStream_t stream
 ) {
-    launch_kernels<true, true, D, StateFP32, HasCheckpoint>(
+    launch_kernels<true, true, D, StateT == StateDtype::FP32, HasCheckpoint>(
         q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
         workspace_ptr, total_tiles, T_total, H, N,
@@ -361,7 +361,7 @@ void launch_prepare(
 // ==================== launch_recurrence ====================
 template <
     int D,
-    bool StateFP32,
+    StateDtype StateT,
     bool HasCheckpoint>
 void launch_recurrence(
     cutlass::bfloat16_t const* v_ptr,
@@ -381,7 +381,7 @@ void launch_recurrence(
     int num_sms,
     cudaStream_t stream
 ) {
-    launch_kernels<false, true, D, StateFP32, HasCheckpoint>(
+    launch_kernels<false, true, D, StateT == StateDtype::FP32, HasCheckpoint>(
         nullptr, nullptr, v_ptr, nullptr, beta_ptr, initial_state_ptr, 0.0f,
         final_state_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr, out_ptr,
         workspace_ptr, total_tiles, T_total, H, N, 0, 0, v_token_stride,
@@ -389,8 +389,8 @@ void launch_recurrence(
 }
 
 // Explicit instantiations: 1 K1 + 8 K2 ({256t, 192t} x {BF16, FP32} x {CKPT=0, 1})
-#define INSTANTIATE_LAUNCH_FWD(D, FP32, CKPT) \
-    template void launch_fwd<D, FP32, CKPT>( \
+#define INSTANTIATE_LAUNCH_FWD(D, STATE_T, CKPT) \
+    template void launch_fwd<D, STATE_T, CKPT>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
@@ -399,21 +399,21 @@ void launch_recurrence(
         int32_t const*, float const*, float const*, float, int, \
         cudaStream_t);
 
-#define INSTANTIATE_LAUNCH_RECURRENCE(D, FP32, CKPT) \
-    template void launch_recurrence<D, FP32, CKPT>( \
+#define INSTANTIATE_LAUNCH_RECURRENCE(D, STATE_T, CKPT) \
+    template void launch_recurrence<D, STATE_T, CKPT>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         void const*, void*, void*, int32_t const*, \
         cutlass::bfloat16_t*, void*, int, int, int, int, \
         int64_t, int32_t const*, int, cudaStream_t);
 
-#define INSTANTIATE_VARIANTS(FP32, CKPT) \
-    INSTANTIATE_LAUNCH_FWD(128, FP32, CKPT) \
-    INSTANTIATE_LAUNCH_RECURRENCE(128, FP32, CKPT)
+#define INSTANTIATE_VARIANTS(STATE_T, CKPT) \
+    INSTANTIATE_LAUNCH_FWD(128, STATE_T, CKPT) \
+    INSTANTIATE_LAUNCH_RECURRENCE(128, STATE_T, CKPT)
 
-INSTANTIATE_VARIANTS(false, false)
-INSTANTIATE_VARIANTS(false, true)
-INSTANTIATE_VARIANTS(true,  false)
-INSTANTIATE_VARIANTS(true,  true)
+INSTANTIATE_VARIANTS(StateDtype::BF16, false)
+INSTANTIATE_VARIANTS(StateDtype::BF16, true)
+INSTANTIATE_VARIANTS(StateDtype::FP32, false)
+INSTANTIATE_VARIANTS(StateDtype::FP32, true)
 
 template void launch_prepare<128>(
     cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,

@@ -55,16 +55,29 @@ def fwd(
     """
     B, T_seq, H = q.shape[:3]
     if cu_seqlens is None:
-        cu_seqlens = torch.arange(
-            0, (B + 1) * T_seq, T_seq, dtype=torch.int32, device=q.device
-        )
+        if T_seq == 0:
+            cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+        else:
+            cu_seqlens = torch.arange(
+                0, (B + 1) * T_seq, T_seq, dtype=torch.int32, device=q.device
+            )
         if B > 1:
-            q = q.reshape(1, B * T_seq, H, -1)
-            k = k.reshape(1, B * T_seq, H, -1)
-            v = v.reshape(1, B * T_seq, H, -1)
-            g = g.reshape(1, B * T_seq, H, -1)
+            D = q.shape[3]
+            for name, t in (("k", k), ("v", v), ("g", g), ("out", out)):
+                if t.shape != (B, T_seq, H, D):
+                    raise ValueError(
+                        f"{name} must have shape {(B, T_seq, H, D)}, got {tuple(t.shape)}"
+                    )
+            if beta.shape != (B, T_seq, H):
+                raise ValueError(
+                    f"beta must have shape {(B, T_seq, H)}, got {tuple(beta.shape)}"
+                )
+            q = q.reshape(1, B * T_seq, H, D)
+            k = k.reshape(1, B * T_seq, H, D)
+            v = v.reshape(1, B * T_seq, H, D)
+            g = g.reshape(1, B * T_seq, H, D)
             beta = beta.reshape(1, B * T_seq, H)
-            out = out.view(1, B * T_seq, H, -1)
+            out = out.view(1, B * T_seq, H, D)
     elif cu_seqlens.dtype == torch.int64:
         cu_seqlens = cu_seqlens.to(torch.int32)
     N = cu_seqlens.numel() - 1

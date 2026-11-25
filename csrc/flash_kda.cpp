@@ -242,8 +242,8 @@ void fwd(
         ? static_cast<int32_t const*>(checkpoint_offsets->const_data_ptr())
         : nullptr;
 
-    #define LAUNCH(FP32, CKPT) \
-        launch_fwd<128, FP32, CKPT>( \
+    #define LAUNCH(STATE_T, CKPT) \
+        launch_fwd<128, STATE_T, CKPT>( \
             q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
             initial_state_raw, scale_f, final_state_raw, \
             checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
@@ -253,15 +253,15 @@ void fwd(
 
     if (has_checkpoint) {
         if (state_fp32) {
-            LAUNCH(true, true);
+            LAUNCH(StateDtype::FP32, true);
         } else {
-            LAUNCH(false, true);
+            LAUNCH(StateDtype::BF16, true);
         }
     } else {
         if (state_fp32) {
-            LAUNCH(true, false);
+            LAUNCH(StateDtype::FP32, false);
         } else {
-            LAUNCH(false, false);
+            LAUNCH(StateDtype::BF16, false);
         }
     }
 
