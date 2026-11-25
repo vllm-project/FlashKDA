@@ -127,15 +127,18 @@ def run_fla_gold_reference(q, k, v, g, beta, h0, A_log, dt_bias, scale, lower_bo
 
 
 def run_flash_kda_batched(q, k, v, g, beta, h0, A_log, dt_bias, scale, lower_bound, cu_seqlens=None):
-    """Run flash_kda.fwd with [B, T, H, D] inputs from FLA tensor layout."""
+    """Run flash_kda.fwd with [1, T, H, D] inputs from FLA tensor layout."""
     h0_bf16 = h0.to(torch.bfloat16).clone()
     final_state_fk = torch.zeros_like(h0_bf16)
     out_fk = torch.zeros(q.shape, dtype=torch.bfloat16, device=q.device)
-    fwd_kwargs = dict(cu_seqlens=cu_seqlens) if cu_seqlens is not None else {}
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
+    else:
+        cu_seqlens = cu_seqlens.to(torch.int32)
     flash_kda.fwd(q.to(torch.bfloat16), k.to(torch.bfloat16), v.clone(), g.to(torch.bfloat16),
                   beta.to(torch.bfloat16).clone(), scale, out_fk,
                   A_log=A_log.clone(), dt_bias=dt_bias.clone(), lower_bound=lower_bound,
-                  initial_state=h0_bf16, final_state=final_state_fk, **fwd_kwargs)
+                  cu_seqlens=cu_seqlens, initial_state=h0_bf16, final_state=final_state_fk)
     torch.cuda.synchronize()
 
     return out_fk, final_state_fk.float()
@@ -240,10 +243,12 @@ def test_fwd():
     scale = 1.0 / math.sqrt(D)
 
     # cutlass kernel
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device='cuda')
     final_state_kernel = torch.zeros_like(initial_state)
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  cu_seqlens=cu_seqlens,
                   initial_state=initial_state.clone(), final_state=final_state_kernel)
     torch.cuda.synchronize()
 
@@ -271,7 +276,7 @@ def test_fwd_varlen():
     N = len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-        dtype=torch.long, device='cuda',
+        dtype=torch.int32, device='cuda',
     )
 
     print(f"\ntest_fwd_varlen: seq_lens={seq_lens}, T_total={T_total}, N={N}, H={H}, D={D}")

@@ -42,9 +42,9 @@ void fwd(
     const Tensor& A_log,
     const Tensor& dt_bias,
     double lower_bound,
+    const Tensor& cu_seqlens,
     std::optional<Tensor> initial_state,
     std::optional<Tensor> final_state,
-    std::optional<Tensor> cu_seqlens,
     std::optional<Tensor> checkpoint_state,
     std::optional<Tensor> checkpoint_offsets
 ) {
@@ -102,9 +102,8 @@ void fwd(
             co.is_cuda() && co.is_contiguous(),
             "checkpoint_offsets must be a contiguous CUDA tensor");
         STD_TORCH_CHECK(
-            co.scalar_type() == ScalarType::Int ||
-                co.scalar_type() == ScalarType::Long,
-            "checkpoint_offsets must be int32 or int64");
+            co.scalar_type() == ScalarType::Int,
+            "checkpoint_offsets must be int32");
     }
     // If both present, dtypes must match
     if (has_state_in && has_state_out) {
@@ -188,29 +187,17 @@ void fwd(
         ? checkpoint_state->mutable_data_ptr()
         : nullptr;
 
-    // Determine cu_seqlens and N
-    bool is_varlen = cu_seqlens.has_value();
-    int64_t N_val;
-    void const* cu_seqlens_dev = nullptr;
-    bool cu_seqlens_is_int32 = false;
-
-    if (is_varlen) {
-        STD_TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
-        auto& cu_seqlens_t = cu_seqlens.value();
-        STD_TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
-        STD_TORCH_CHECK(
-            cu_seqlens_t.scalar_type() == ScalarType::Int ||
-                cu_seqlens_t.scalar_type() == ScalarType::Long,
-            "cu_seqlens must be int32 or int64");
-        STD_TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
-        STD_TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
-        N_val = cu_seqlens_t.numel() - 1;
-        STD_TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-        cu_seqlens_is_int32 = cu_seqlens_t.scalar_type() == ScalarType::Int;
-        cu_seqlens_dev = cu_seqlens_t.const_data_ptr();
-    } else {
-        N_val = B;
-    }
+    // Validate cu_seqlens (varlen int32 only)
+    STD_TORCH_CHECK(B == 1, "B must be 1 for varlen cu_seqlens");
+    STD_TORCH_CHECK(cu_seqlens.is_cuda(), "cu_seqlens must be on CUDA");
+    STD_TORCH_CHECK(
+        cu_seqlens.scalar_type() == ScalarType::Int,
+        "cu_seqlens must be int32");
+    STD_TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous");
+    STD_TORCH_CHECK(cu_seqlens.dim() == 1, "cu_seqlens must be 1D");
+    int64_t N_val = cu_seqlens.numel() - 1;
+    STD_TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
+    int32_t const* cu_seqlens_dev = static_cast<int32_t const*>(cu_seqlens.const_data_ptr());
 
     int num_sms = 0;
     cudaError_t attr_status = cudaDeviceGetAttribute(
@@ -245,73 +232,36 @@ void fwd(
         STD_TORCH_CHECK(
             co.dim() == 1 && co.size(0) == N_val,
             "checkpoint_offsets must be [N]");
-        STD_TORCH_CHECK(
-            co.scalar_type() ==
-                (cu_seqlens_is_int32 ? ScalarType::Int : ScalarType::Long),
-            "checkpoint_offsets and cu_seqlens must have matching dtypes");
     }
 
-    int total_tiles;
-    if (is_varlen) {
-        total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val);  // upper bound for varlen
-    } else {
-        total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
-    }
+    int total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val);  // upper bound for varlen
 
-    auto dispatch = [&](auto typed_cu_seqlens) {
-        using SeqlenPtr = decltype(typed_cu_seqlens);
-        SeqlenPtr typed_checkpoint_offsets = has_checkpoint
-            ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
-            : nullptr;
-        #define LAUNCH(HI, HO, FP32, CKPT, VL) \
-            launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
-                q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
-                initial_state_raw, scale_f, final_state_raw, \
-                checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
-                workspace_ptr, total_tiles, \
-                int(T_total), int(H), int(N_val), q_stride, k_stride, v_stride, \
-                typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
+    int32_t const* typed_checkpoint_offsets = has_checkpoint
+        ? static_cast<int32_t const*>(checkpoint_offsets->const_data_ptr())
+        : nullptr;
 
-        #define DISPATCH_STATE(CKPT, VL) \
-            if (!has_state_in && !has_state_out && state_fp32) { \
-                LAUNCH(false, false, true, CKPT, VL); \
-            } else if (!has_state_in && !has_state_out) { \
-                LAUNCH(false, false, false, CKPT, VL); \
-            } else if (has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(true, true, true, CKPT, VL); \
-            } else if (has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(true, true, false, CKPT, VL); \
-            } else if (!has_state_in && has_state_out && state_fp32) { \
-                LAUNCH(false, true, true, CKPT, VL); \
-            } else if (!has_state_in && has_state_out && !state_fp32) { \
-                LAUNCH(false, true, false, CKPT, VL); \
-            } else if (has_state_in && !has_state_out && state_fp32) { \
-                LAUNCH(true, false, true, CKPT, VL); \
-            } else { \
-                LAUNCH(true, false, false, CKPT, VL); \
-            }
+    #define LAUNCH(STATE_T, CKPT) \
+        launch_fwd<128, STATE_T, CKPT>( \
+            q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+            initial_state_raw, scale_f, final_state_raw, \
+            checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
+            workspace_ptr, total_tiles, \
+            int(T_total), int(H), int(N_val), q_stride, k_stride, v_stride, \
+            cu_seqlens_dev, A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
 
-        if (is_varlen) {
-            if (has_checkpoint) {
-                DISPATCH_STATE(true, true);
-            } else {
-                DISPATCH_STATE(false, true);
-            }
+    if (has_checkpoint) {
+        if (state_fp32) {
+            LAUNCH(FlashKdaStateDtype::FP32, true);
         } else {
-            if (has_checkpoint) {
-                DISPATCH_STATE(true, false);
-            } else {
-                DISPATCH_STATE(false, false);
-            }
+            LAUNCH(FlashKdaStateDtype::BF16, true);
         }
-
-        #undef DISPATCH_STATE
-        #undef LAUNCH
-    };
-
-    if (cu_seqlens_is_int32) {
-        dispatch(static_cast<int32_t const*>(cu_seqlens_dev));
     } else {
-        dispatch(static_cast<int64_t const*>(cu_seqlens_dev));
+        if (state_fp32) {
+            LAUNCH(FlashKdaStateDtype::FP32, false);
+        } else {
+            LAUNCH(FlashKdaStateDtype::BF16, false);
+        }
     }
+
+    #undef LAUNCH
 }

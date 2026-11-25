@@ -39,13 +39,13 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     T_total = sum(seq_lens)
     N = len(seq_lens)
 
+    cu_seqlens_offsets = [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist())
+    cu_seqlens_fk = torch.tensor(cu_seqlens_offsets, dtype=torch.int32, device=device)
+
     if varlen:
-        cu_seqlens = torch.tensor(
-            [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-            dtype=torch.long, device=device,
-        )
+        cu_seqlens_fla = torch.tensor(cu_seqlens_offsets, dtype=torch.long, device=device)
         print(f"varlen shape=[{T_total},{H},{D}] seq_lens={seq_lens} warmup={warmup} iters={iters} repeats={repeats}")
-        extra = {"cu_seqlens": cu_seqlens}
+        extra = {"cu_seqlens": cu_seqlens_fla}
     else:
         print(f"shape=[{T_total},{H},{D}] warmup={warmup} iters={iters} repeats={repeats}")
         extra = {}
@@ -67,7 +67,8 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state, final_state=final_state, **extra)
+                      cu_seqlens=cu_seqlens_fk,
+                      initial_state=initial_state, final_state=final_state)
 
     mean, mn, mx = bench_fn(run_flash_kda, warmup, iters, repeats)
     print(f"  flash_kda (bf16 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -75,7 +76,8 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     # --- flash_kda: no state ---
     def run_flash_kda_no_state():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
-                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND, **extra)
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      cu_seqlens=cu_seqlens_fk)
 
     mean, mn, mx = bench_fn(run_flash_kda_no_state, warmup, iters, repeats)
     print(f"  flash_kda (no state)   : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -87,7 +89,8 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda_fp32():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state_fp32, final_state=final_state_fp32, **extra)
+                      cu_seqlens=cu_seqlens_fk,
+                      initial_state=initial_state_fp32, final_state=final_state_fp32)
 
     mean, mn, mx = bench_fn(run_flash_kda_fp32, warmup, iters, repeats)
     print(f"  flash_kda (fp32 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")

@@ -9,8 +9,8 @@ STABLE_TORCH_LIBRARY(flash_kda, m) {
     m.def(
         "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
         "float scale, Tensor(a!) out, Tensor(c!) workspace, Tensor A_log, "
-        "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
-        "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
+        "Tensor dt_bias, float lower_bound, Tensor cu_seqlens, "
+        "Tensor? initial_state=None, Tensor(b!)? final_state=None, "
         "Tensor(d!)? checkpoint_state=None, "
         "Tensor? checkpoint_offsets=None) -> ()");
 }

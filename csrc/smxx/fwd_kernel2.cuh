@@ -174,12 +174,8 @@ template <
     int InputStages,
     int OutputStages,
     int NumThreads,
-    bool HasStateIn = true,
-    bool HasStateOut = true,
     bool StateFP32 = false,
     bool HasCheckpoint = false,
-    bool IsVarlen = true,
-    typename SeqlenT = int64_t,
     int VD = D
 >
 __global__ void __launch_bounds__(NumThreads, k2_min_blocks_per_sm<NumThreads>())
@@ -191,12 +187,14 @@ _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
     void* checkpoint_state_raw,
-    SeqlenT const* checkpoint_offsets,
+    int32_t const* checkpoint_offsets,
     int T_total,
     int H,
     int N,
-    SeqlenT const* cu_seqlens,
+    int32_t const* cu_seqlens,
     int total_tiles,
+    bool has_state_in,
+    bool has_state_out,
     cutlass::bfloat16_t const* ws_kd,
     cutlass::bfloat16_t const* ws_qd,
     cutlass::bfloat16_t const* ws_kr,
@@ -269,7 +267,7 @@ _flash_kda_fwd_recurrence(
         warp_role = WarpRole::STORE;
     }
 
-    if constexpr (HasStateIn) {
+    if (has_state_in) {
         if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
             shared_storage.state_acc_tma_barrier.init(1);
             cutlass::arch::fence_barrier_init();
@@ -296,36 +294,23 @@ _flash_kda_fwd_recurrence(
     // --- per-block sequence info
     int v_idx = int(blockIdx.x) % kVSlices;
     int head_idx = int(blockIdx.x) / kVSlices;
-    int seq_idx = int(blockIdx.y);
-    if constexpr (IsVarlen) {
-        // vLLM orders decodes before prefills. Reverse that order so the
-        // long-running prefill CTAs are issued first.
-        seq_idx = N - 1 - seq_idx;
+    // vLLM orders decodes before prefills. Reverse that order so the
+    // long-running prefill CTAs are issued first.
+    int seq_idx = N - 1 - int(blockIdx.y);
+    int64_t bos = __shfl_sync(0xffffffff, cu_seqlens[seq_idx], 0);
+    int64_t eos = __shfl_sync(0xffffffff, cu_seqlens[seq_idx + 1], 0);
+    // Compute tile_base via linear scan (no host-precomputed table).
+    // Broadcast via shfl_sync so ptxas keeps it in uniform (UR) registers.
+    int tb = 0;
+    for (int i = 0; i < seq_idx; i++) {
+        tb += (int(cu_seqlens[i + 1] - cu_seqlens[i]) + CHUNK - 1) / CHUNK;
     }
-    int64_t bos, eos;
-    int tile_base;
-
-    if constexpr (IsVarlen) {
-        bos = __shfl_sync(0xffffffff, cu_seqlens[seq_idx], 0);
-        eos = __shfl_sync(0xffffffff, cu_seqlens[seq_idx + 1], 0);
-        // Compute tile_base via linear scan (no host-precomputed table).
-        // Broadcast via shfl_sync so ptxas keeps it in uniform (UR) registers.
-        int tb = 0;
-        for (int i = 0; i < seq_idx; i++) {
-            tb += (int(cu_seqlens[i + 1] - cu_seqlens[i]) + CHUNK - 1) / CHUNK;
-        }
-        tile_base = __shfl_sync(0xffffffff, tb, 0);
-    } else {
-        int T_seq = T_total / N;
-        bos = int64_t(seq_idx) * T_seq;
-        eos = bos + T_seq;
-        tile_base = seq_idx * ((T_seq + CHUNK - 1) / CHUNK);
-    }
+    int tile_base = __shfl_sync(0xffffffff, tb, 0);
     int seq_len  = int(eos - bos);
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
 
     // --- Load initial state
-    if constexpr (HasStateIn && !StateFP32) {
+    if (has_state_in && !StateFP32) {
         // BF16 state: TMA load directly into state_acc
         if (warp_role == WarpRole::LOAD_QKG) {
             using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
@@ -349,7 +334,7 @@ _flash_kda_fwd_recurrence(
             shared_storage.state_acc_tma_barrier.wait(0);
         }
         __syncthreads();
-    } else if constexpr (HasStateIn && StateFP32) {
+    } else if (has_state_in && StateFP32) {
         // FP32 state: TMA load fp32 into pipeline buffer, then convert to bf16 in state_acc
         using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
         using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
@@ -525,7 +510,7 @@ _flash_kda_fwd_recurrence(
         using ResidentStateAcc = decltype(resident_thr_mma.make_fragment_C(resident_c_ref));
         constexpr int kResidentStateRowBlocks = D / 16;
         ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
-        SeqlenT checkpoint_offset = 0;
+        int32_t checkpoint_offset = 0;
         if constexpr (HasCheckpoint) {
             checkpoint_offset = checkpoint_offsets[seq_idx];
         }
@@ -851,8 +836,8 @@ _flash_kda_fwd_recurrence(
 
                     // The store warp observes the last output-stage commit only
                     // after these writes and the following shared-memory fence.
-                    if constexpr (HasStateOut && !kSpillAfterUpdate) {
-                        if (t + 1 == t_tiles || export_checkpoint) {
+                    if constexpr (!kSpillAfterUpdate) {
+                        if ((has_state_out && t + 1 == t_tiles) || export_checkpoint) {
                             Tensor s_block = local_tile(
                                 s_acc_T,
                                 make_shape(Int<16>{}, Int<16>{}),
@@ -860,19 +845,10 @@ _flash_kda_fwd_recurrence(
                             auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
                             copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
                         }
-                    } else if (export_checkpoint && !kSpillAfterUpdate) {
-                        Tensor s_block = local_tile(
-                            s_acc_T,
-                            make_shape(Int<16>{}, Int<16>{}),
-                            make_coord(
-                                m,
-                                warp_id * kValueBlocksPerWarp + bi));
-                        auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
-                        copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
                     }
                 }
             }
-            if (kSpillAfterUpdate && ((HasStateOut && t + 1 == t_tiles) || export_checkpoint)) {
+            if (kSpillAfterUpdate && ((has_state_out && t + 1 == t_tiles) || export_checkpoint)) {
                 #pragma unroll
                 for (int m = 0; m < S_M_BLOCKS; ++m) {
                     #pragma unroll
@@ -962,7 +938,7 @@ _flash_kda_fwd_recurrence(
             ++out_read;
         }
 
-        if constexpr (HasStateOut && !StateFP32) {
+        if (has_state_out && !StateFP32) {
             if (lane_predicate) {
                 // BF16 state: TMA store directly from state_acc
                 Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
@@ -983,7 +959,7 @@ _flash_kda_fwd_recurrence(
         }
     }
 
-    if constexpr (HasStateOut && StateFP32) {
+    if (has_state_out && StateFP32) {
         // FP32 state: all threads sync, convert bf16->fp32, then STORE warp does TMA
         using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
         using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;

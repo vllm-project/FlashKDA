@@ -2,7 +2,7 @@
 
 The cases are deliberately small (``H=2`` and at most 64 tokens) so this file
 is suitable for the focused B300 test entry.  Coverage is nevertheless across
-fixed and varlen dispatch, both cu_seqlens integer types, empty sequences, all
+single-sequence, multi-sequence, and empty-sequence varlen dispatch, all
 state input/output modes, and both supported state dtypes.  The automatic
 dispatch selects V-split for these low-parallelism cases, and every result is
 compared directly and bit-for-bit with ``torch_ref``.
@@ -98,12 +98,12 @@ def _make_problem(
 
 
 def _make_fixed_problem() -> Problem:
-    # B>1 also checks fixed-length sequence-to-state indexing.  T=17 crosses a
-    # chunk boundary and exercises the manual tail output store.
+    # Two equal-length 17-token sequences check multi-sequence state indexing
+    # and the manual tail output store.
     return _make_problem(
-        batch=2,
-        seq_len=17,
-        cu_seqlens=None,
+        batch=1,
+        seq_len=34,
+        cu_seqlens=torch.tensor([0, 17, 34], dtype=torch.int32, device="cuda"),
         num_sequences=2,
         seed=101,
     )
@@ -115,7 +115,7 @@ def _make_stage_reuse_problem() -> Problem:
     return _make_problem(
         batch=1,
         seq_len=64,
-        cu_seqlens=None,
+        cu_seqlens=torch.tensor([0, 64], dtype=torch.int32, device="cuda"),
         num_sequences=1,
         seed=404,
     )
@@ -266,16 +266,9 @@ def test_vsplit_stage_reuse_exact() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "cu_dtype",
-    (torch.int32, torch.int64),
-    ids=("cu_int32", "cu_int64"),
-)
 @pytest.mark.parametrize("state_case", STATE_CASES, ids=lambda case: case.name)
-def test_vsplit_varlen_exact(
-    state_case: StateCase, cu_dtype: torch.dtype
-) -> None:
-    _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)
+def test_vsplit_varlen_exact(state_case: StateCase) -> None:
+    _assert_vsplit_exact(_make_varlen_problem(torch.int32), state_case)
 
 
 @pytest.mark.parametrize("fillers", (0, 256), ids=("vsplit", "full_width"))
