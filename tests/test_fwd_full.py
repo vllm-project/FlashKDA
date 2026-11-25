@@ -76,10 +76,11 @@ def test_fwd_fixed(T, H, state_dtype, has_in, has_out):
     final_k = torch.zeros(1, H, D, D, dtype=dtype, device="cuda") if has_out else None
     final_r = torch.zeros(1, H, D, D, dtype=dtype, device="cuda") if has_out else None
 
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device="cuda")
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
+                  cu_seqlens=cu_seqlens, initial_state=init_k, final_state=final_k)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)
@@ -121,7 +122,7 @@ def test_fwd_varlen(seq_lens, H, state_dtype, has_in, has_out):
     N = len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-        dtype=torch.long, device="cuda",
+        dtype=torch.int32, device="cuda",
     )
 
     q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T_total, H)
@@ -151,61 +152,6 @@ def test_fwd_varlen(seq_lens, H, state_dtype, has_in, has_out):
 
 
 # ---------------------------------------------------------------------------
-# Batched tests (B > 1, equal-length sequences)
-# ---------------------------------------------------------------------------
-
-BATCH_CASES = [
-    (2, 64),
-    (2, 1024),
-    (4, 256),
-    (8, 128),
-]
-BATCH_H = [1, 4, 96]
-
-
-@pytest.mark.parametrize("H", BATCH_H, ids=[f"H{h}" for h in BATCH_H])
-@pytest.mark.parametrize("B,T", BATCH_CASES, ids=[f"B{b}_T{t}" for b, t in BATCH_CASES])
-@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
-@pytest.mark.parametrize("has_in,has_out", STATE_IO, ids=STATE_IO_IDS)
-def test_fwd_batched(B, T, H, state_dtype, has_in, has_out):
-    torch.manual_seed(42)
-    dtype = torch.bfloat16 if state_dtype == "bf16" else torch.float32
-
-    q = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
-    k = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
-    v = torch.randn((B, T, H, D), dtype=torch.bfloat16, device="cuda")
-    g = torch.randn((B, T, H, D), dtype=torch.bfloat16, device="cuda")
-    beta = torch.randn((B, T, H), dtype=torch.bfloat16, device="cuda")
-    A_log = torch.rand(H, dtype=torch.float32, device="cuda")
-    dt_bias = torch.rand(H, D, dtype=torch.float32, device="cuda")
-    scale = 1.0 / math.sqrt(D)
-
-    init_k = _make_state((B, H, D, D), dtype).clone() if has_in else None
-    init_r = _make_state((B, H, D, D), dtype).clone() if has_in else None
-    final_k = torch.zeros(B, H, D, D, dtype=dtype, device="cuda") if has_out else None
-    final_r = torch.zeros(B, H, D, D, dtype=dtype, device="cuda") if has_out else None
-
-    # batched flash_kda (B > 1, auto cu_seqlens)
-    out_kernel = torch.zeros_like(q)
-    flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
-                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
-    torch.cuda.synchronize()
-
-    # torch ref
-    out_ref = torch.zeros_like(q)
-    torch_ref(q, k, v, g, beta, scale, out_ref,
-              A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-              initial_state=init_r, final_state=final_r)
-
-    assert torch.equal(out_kernel, out_ref), \
-        f"output mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
-    if final_k is not None:
-        assert torch.equal(final_k, final_r), \
-            f"final_state mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
-
-
-# ---------------------------------------------------------------------------
 # Long-sequence tests (H=1, in+out bf16 only)
 # ---------------------------------------------------------------------------
 
@@ -226,10 +172,11 @@ def test_fwd_long(T):
     final_k = torch.zeros(1, H, D, D, dtype=torch.bfloat16, device="cuda")
     final_r = torch.zeros(1, H, D, D, dtype=torch.bfloat16, device="cuda")
 
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device="cuda")
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
+                  cu_seqlens=cu_seqlens, initial_state=init_k, final_state=final_k)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)
@@ -249,7 +196,7 @@ def test_fwd_long_varlen(seq_lens):
     N = len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-        dtype=torch.long, device="cuda",
+        dtype=torch.int32, device="cuda",
     )
 
     q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T_total, H)
@@ -289,9 +236,9 @@ def test_row_strided_qkv(H, seq_lens, state_dtype):
     T, N = sum(seq_lens), len(seq_lens)
     q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T, H)
     packed = torch.stack((q, k, v), dim=2)
-    cu_seqlens = None if N == 1 else torch.tensor(
+    cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
-        dtype=torch.long, device="cuda",
+        dtype=torch.int32, device="cuda",
     )
     initial_state = _make_state((N, H, D, D), state_dtype)
 
