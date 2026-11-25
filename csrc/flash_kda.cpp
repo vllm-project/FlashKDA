@@ -42,9 +42,9 @@ void fwd(
     const Tensor& A_log,
     const Tensor& dt_bias,
     double lower_bound,
+    const Tensor& cu_seqlens,
     std::optional<Tensor> initial_state,
     std::optional<Tensor> final_state,
-    std::optional<Tensor> cu_seqlens,
     std::optional<Tensor> checkpoint_state,
     std::optional<Tensor> checkpoint_offsets
 ) {
@@ -188,18 +188,16 @@ void fwd(
         : nullptr;
 
     // Validate cu_seqlens (varlen int32 only)
-    STD_TORCH_CHECK(cu_seqlens.has_value(), "cu_seqlens is required");
-    STD_TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
-    auto& cu_seqlens_t = cu_seqlens.value();
-    STD_TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
+    STD_TORCH_CHECK(B == 1, "B must be 1 for varlen cu_seqlens");
+    STD_TORCH_CHECK(cu_seqlens.is_cuda(), "cu_seqlens must be on CUDA");
     STD_TORCH_CHECK(
-        cu_seqlens_t.scalar_type() == ScalarType::Int,
+        cu_seqlens.scalar_type() == ScalarType::Int,
         "cu_seqlens must be int32");
-    STD_TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
-    STD_TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
-    int64_t N_val = cu_seqlens_t.numel() - 1;
+    STD_TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous");
+    STD_TORCH_CHECK(cu_seqlens.dim() == 1, "cu_seqlens must be 1D");
+    int64_t N_val = cu_seqlens.numel() - 1;
     STD_TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-    int32_t const* cu_seqlens_dev = static_cast<int32_t const*>(cu_seqlens_t.const_data_ptr());
+    int32_t const* cu_seqlens_dev = static_cast<int32_t const*>(cu_seqlens.const_data_ptr());
 
     int num_sms = 0;
     cudaError_t attr_status = cudaDeviceGetAttribute(

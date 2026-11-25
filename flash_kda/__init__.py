@@ -100,7 +100,7 @@ def fwd(
         A_log,
         dt_bias,
         lower_bound,
+        cu_seqlens,
         initial_state=initial_state,
         final_state=final_state,
-        cu_seqlens=cu_seqlens,
     )
