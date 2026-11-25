@@ -367,11 +367,9 @@ CUTLASS_DEVICE void inv_fwd_subst_fused_1warp(
 }
 
 // ==================== FP32 <-> BF16 state conversion in SMEM ====================
-// Both FP32 (K_SW32) and BF16 (K_INTER) layouts resolve to the same 8x8 atom
-// structure with Swizzle<0,0,3>. Conversion operates per-atom:
-//   - Each warp handles one 8x8 atom (64 elements)
-//   - Each thread converts 2 elements
-//   - Warp-level iteration over all atoms in the Rows x Cols state
+// Both FP32 and BF16 state layouts use 128B-swizzled atoms (Swizzle<3,4,3>),
+// so every 4-element group along Cols is contiguous and 8B/16B aligned.
+// Each warp converts one full row (32 lanes x 4 elements = 128) per iteration.
 
 template <class FP32Layout, class BF16Layout, int Rows, int Cols, int NumThreads>
 __device__ void smem_cvt_fp32_to_bf16(
@@ -379,29 +377,23 @@ __device__ void smem_cvt_fp32_to_bf16(
     cutlass::bfloat16_t* __restrict__ bf16_smem,
     int tid
 ) {
-    using BF16 = cutlass::bfloat16_t;
-    constexpr int kBlock = 8;
-    constexpr int kRowBlocks = Rows / kBlock;
-    constexpr int kColBlocks = Cols / kBlock;
-    constexpr int kTotalBlocks = kRowBlocks * kColBlocks;
+    static_assert(Cols == 128, "vectorized state conversion assumes Cols == 128");
     constexpr int kWarpSize = 32;
+    constexpr int kNumWarps = NumThreads / kWarpSize;
 
     auto fp32_view = make_tensor(make_smem_ptr(fp32_smem), FP32Layout{});
     auto bf16_view = make_tensor(make_smem_ptr(bf16_smem), BF16Layout{});
 
     int warp_id = tid / kWarpSize;
-    int lane_id = tid % kWarpSize;
-    int num_warps = NumThreads / kWarpSize;
+    int col = (tid % kWarpSize) * 4;
 
-    for (int blk = warp_id; blk < kTotalBlocks; blk += num_warps) {
-        int br = (blk / kColBlocks) * kBlock;
-        int bc = (blk % kColBlocks) * kBlock;
-        int e0 = lane_id * 2;
-        int e1 = lane_id * 2 + 1;
-        int r0 = br + e0 / kBlock, c0 = bc + e0 % kBlock;
-        int r1 = br + e1 / kBlock, c1 = bc + e1 % kBlock;
-        bf16_view(r0, c0) = BF16(fp32_view(r0, c0));
-        bf16_view(r1, c1) = BF16(fp32_view(r1, c1));
+    #pragma unroll 1
+    for (int r = warp_id; r < Rows; r += kNumWarps) {
+        float4 v = *reinterpret_cast<float4 const*>(&fp32_view(r, col));
+        union { uint2 u; __nv_bfloat162 b2[2]; } out;
+        out.b2[0] = __floats2bfloat162_rn(v.x, v.y);
+        out.b2[1] = __floats2bfloat162_rn(v.z, v.w);
+        *reinterpret_cast<uint2*>(&bf16_view(r, col)) = out.u;
     }
 }
 
@@ -411,27 +403,22 @@ __device__ void smem_cvt_bf16_to_fp32(
     float* __restrict__ fp32_smem,
     int tid
 ) {
-    constexpr int kBlock = 8;
-    constexpr int kRowBlocks = Rows / kBlock;
-    constexpr int kColBlocks = Cols / kBlock;
-    constexpr int kTotalBlocks = kRowBlocks * kColBlocks;
+    static_assert(Cols == 128, "vectorized state conversion assumes Cols == 128");
     constexpr int kWarpSize = 32;
+    constexpr int kNumWarps = NumThreads / kWarpSize;
 
     auto bf16_view = make_tensor(make_smem_ptr(bf16_smem), BF16Layout{});
     auto fp32_view = make_tensor(make_smem_ptr(fp32_smem), FP32Layout{});
 
     int warp_id = tid / kWarpSize;
-    int lane_id = tid % kWarpSize;
-    int num_warps = NumThreads / kWarpSize;
+    int col = (tid % kWarpSize) * 4;
 
-    for (int blk = warp_id; blk < kTotalBlocks; blk += num_warps) {
-        int br = (blk / kColBlocks) * kBlock;
-        int bc = (blk % kColBlocks) * kBlock;
-        int e0 = lane_id * 2;
-        int e1 = lane_id * 2 + 1;
-        int r0 = br + e0 / kBlock, c0 = bc + e0 % kBlock;
-        int r1 = br + e1 / kBlock, c1 = bc + e1 % kBlock;
-        fp32_view(r0, c0) = bf16_to_f32(bf16_view(r0, c0));
-        fp32_view(r1, c1) = bf16_to_f32(bf16_view(r1, c1));
+    #pragma unroll 1
+    for (int r = warp_id; r < Rows; r += kNumWarps) {
+        union { uint2 u; __nv_bfloat162 b2[2]; } in;
+        in.u = *reinterpret_cast<uint2 const*>(&bf16_view(r, col));
+        float2 lo = __bfloat1622float2(in.b2[0]);
+        float2 hi = __bfloat1622float2(in.b2[1]);
+        *reinterpret_cast<float4*>(&fp32_view(r, col)) = make_float4(lo.x, lo.y, hi.x, hi.y);
     }
 }

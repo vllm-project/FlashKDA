@@ -233,10 +233,9 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         shared_storage.a_log_exp = expf(A_log_ptr[head_idx]);
     }
     // --- Wait for TMA (q, k, beta, g_bf16, dt_bias)
+    // mbarrier.try_wait completion makes TMA writes visible to generic proxy.
     __syncthreads();
     shared_storage.tma_load_barrier.wait(0);
-    cutlass::arch::fence_view_async_shared();
-    __syncthreads();
 
     int compute_tid = threadIdx.x;
     int beta_smem_offset = (head_idx * T_total + int(bos) + local_t * CHUNK) & 7;
@@ -434,30 +433,25 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
 
                 Tensor r_qd = make_tensor_like<BF16>(s_qd);
                 Tensor r_kd = make_tensor_like<BF16>(s_kd);
+                Tensor r_ki = make_tensor_like<BF16>(s_ki);
+                Tensor r_kr = make_tensor_like<BF16>(s_kr);
                 float q_inv = shared_storage.q_norm_inv.begin()[row];
                 float k_inv_scale = shared_storage.k_norm_inv.begin()[row];
+                bool row_valid = row < actual_len;
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[pass][tile_idx][v];
                     BF16 q = BF16(bf16_to_f32(reg_q[pass][tile_idx][v]) * q_inv);
-                    BF16 k = row < actual_len ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
+                    BF16 k = row_valid ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
                     BF16 exp_cumsum = BF16(ex2_approx_ftz_f32(g));
+                    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
                     r_qd(0, v) = q * exp_cumsum * BF16(scale);
                     r_kd(0, v) = k * exp_cumsum;
-                }
-                cute::copy(AutoVectorizingCopy{}, r_qd, s_qd);
-                cute::copy(AutoVectorizingCopy{}, r_kd, s_kd);
-
-                Tensor r_ki = make_tensor_like<BF16>(s_ki);
-                Tensor r_kr = make_tensor_like<BF16>(s_kr);
-                #pragma unroll
-                for (int v = 0; v < 2; ++v) {
-                    float g = reg_g[pass][tile_idx][v];
-                    BF16 k = row < actual_len ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
-                    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
                     r_ki(0, v) = k * inv_cumsum;
                     r_kr(0, v) = k * inv_cumsum * BF16(reg_gt[pass][tile_idx][v]);
                 }
+                cute::copy(AutoVectorizingCopy{}, r_qd, s_qd);
+                cute::copy(AutoVectorizingCopy{}, r_kd, s_kd);
                 cute::copy(AutoVectorizingCopy{}, r_ki, s_ki);
                 cute::copy(AutoVectorizingCopy{}, r_kr, s_kr);
                 }
@@ -511,31 +505,27 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         BF16* k_decayed_dst = ws_kd + int64_t(ws_idx) * (CHUNK * D);
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.k_decayed.begin(), k_decayed_dst, int32_t(CHUNK * D * sizeof(BF16)));
-        tma_store_arrive();
 
         BF16* q_decayed_dst = ws_qd + int64_t(ws_idx) * (CHUNK * D);
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.q_decayed.begin(), q_decayed_dst, int32_t(CHUNK * D * sizeof(BF16)));
-        tma_store_arrive();
 
         BF16* k_restored_dst = ws_kr + int64_t(ws_idx) * (CHUNK * D);
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.k_restored.begin(), k_restored_dst, int32_t(CHUNK * D * sizeof(BF16)));
-        tma_store_arrive();
 
         float* g_total_dst = ws_gt + int64_t(ws_idx) * D;
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.g_total.begin(), g_total_dst, int32_t(D * sizeof(float)));
-        tma_store_arrive();
 
         BF16* inv_dst = ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK);
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.INV.begin(), inv_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
-        tma_store_arrive();
 
         BF16* mqk_dst = ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK);
         cute::SM90_BULK_COPY_S2G::copy(
             shared_storage.Mqk.begin(), mqk_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
+
         tma_store_arrive();
         tma_store_wait<0>();
     }
