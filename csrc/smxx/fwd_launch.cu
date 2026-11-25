@@ -223,11 +223,7 @@ static void launch_kernels(
                 VD>;
 
             int blocks_per_sm = 1;
-            // On sm_10x a V-split grid at two blocks per SM is slower than full width.
-            cudaFuncAttributes attr;
-            if (vsplit_blocks > num_sms &&
-                cudaFuncGetAttributes(&attr, kernel2) == cudaSuccess &&
-                attr.binaryVersion / 10 != 10) {
+            if (vsplit_blocks > num_sms) {
                 cudaFuncSetAttribute(
                     kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                     smem_size_k2);
